@@ -16,6 +16,8 @@ the patches.
 
 ## yDATV-Repeater in action
 
+[![yDATV-Repeater in action](https://i.ytimg.com/vi/p3D83u95pEU/maxresdefault.jpg)](https://youtu.be/p3D83u95pEU)
+
 ▶️ **[Watch on YouTube: AdalmPluto yATOLYE DATV Repeater Project](https://youtu.be/p3D83u95pEU)**
 
 > **Note:** Transmitting at 5.65–5.85 GHz requires an amateur radio licence
