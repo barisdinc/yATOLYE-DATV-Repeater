@@ -1,0 +1,458 @@
+From 96a7752ddae03e2bf10d3bff0f7391a418255c87 Mon Sep 17 00:00:00 2001
+From: Baris Dinc <barisdinc@gmail.com>
+Date: Sun, 11 Oct 2026 13:59:05 +0300
+Subject: [PATCH 1/2] library: Add axi_datv_xpdr DATV transponder core
+
+Add a small AXI-Lite controlled core that relays the AD936x RX samples
+to the TX path for use as a DATV repeater (transponder). The RF
+frequency translation is done by the independent RX/TX LOs of the
+AD936x, the core only processes the baseband samples:
+
+- enable/bypass: when disabled the TX path is fed by the regular
+  DMA/interpolator data, so normal libiio TX keeps working
+- digital gain (unsigned Q4.12) with saturation and a saturation counter
+- averaged I^2+Q^2 power detector (IIR, time constant 2^n samples)
+- squelch with configurable threshold and hang time, force mute
+
+Control registers cross into the data clock domain with up_xfer_cntrl,
+status registers with up_xfer_status.
+---
+ library/axi_datv_xpdr/Makefile             |  17 +
+ library/axi_datv_xpdr/axi_datv_xpdr.v      | 374 +++++++++++++++++++++
+ library/axi_datv_xpdr/axi_datv_xpdr_ip.tcl |  19 ++
+ 3 files changed, 410 insertions(+)
+ create mode 100644 library/axi_datv_xpdr/Makefile
+ create mode 100644 library/axi_datv_xpdr/axi_datv_xpdr.v
+ create mode 100644 library/axi_datv_xpdr/axi_datv_xpdr_ip.tcl
+
+diff --git a/library/axi_datv_xpdr/Makefile b/library/axi_datv_xpdr/Makefile
+new file mode 100644
+index 000000000..216b927d2
+--- /dev/null
++++ b/library/axi_datv_xpdr/Makefile
+@@ -0,0 +1,17 @@
++####################################################################################
++## Copyright (c) 2018 - 2023 Analog Devices, Inc.
++### SPDX short identifier: BSD-1-Clause
++####################################################################################
++
++LIBRARY_NAME := axi_datv_xpdr
++
++GENERIC_DEPS += ../common/up_axi.v
++GENERIC_DEPS += ../common/up_xfer_cntrl.v
++GENERIC_DEPS += ../common/up_xfer_status.v
++GENERIC_DEPS += axi_datv_xpdr.v
++
++XILINX_DEPS += ../xilinx/common/up_xfer_cntrl_constr.xdc
++XILINX_DEPS += ../xilinx/common/up_xfer_status_constr.xdc
++XILINX_DEPS += axi_datv_xpdr_ip.tcl
++
++include ../scripts/library.mk
+diff --git a/library/axi_datv_xpdr/axi_datv_xpdr.v b/library/axi_datv_xpdr/axi_datv_xpdr.v
+new file mode 100644
+index 000000000..2e2f6cf4b
+--- /dev/null
++++ b/library/axi_datv_xpdr/axi_datv_xpdr.v
+@@ -0,0 +1,374 @@
++// ***************************************************************************
++// ***************************************************************************
++// DATV repeater (transponder) datapath for the PlutoSDR.
++//
++// Takes the AD936x RX samples (I0/Q0) and, when enabled, feeds them to the
++// TX path instead of the DMA/interpolator data. The RF frequency translation
++// is done by the independent RX/TX LOs of the AD936x; this core only applies
++// a digital gain with saturation and a power based squelch.
++//
++// Register map (byte offsets):
++//   0x000  VERSION     RO
++//   0x004  ID          RO
++//   0x008  SCRATCH     RW
++//   0x00C  MAGIC       RO  "DATV"
++//   0x040  CONTROL     RW  [0] enable (TX fed from RX)
++//                          [1] squelch enable
++//                          [2] force mute
++//   0x044  GAIN        RW  [15:0] unsigned Q4.12, 0x1000 = 0 dB (ADC FS -> DAC FS)
++//   0x048  SQ_THRESH   RW  [23:0] squelch open threshold, compared to POWER
++//   0x04C  SQ_HANG     RW  [31:0] squelch hang time in samples
++//   0x050  AVG_SHIFT   RW  [4:0]  power averaging, IIR time constant 2^n samples
++//   0x080  STATUS      RO  [0] enable, [1] squelch open (TX active)
++//   0x084  POWER       RO  [23:0] averaged I^2+Q^2 (12-bit samples)
++//   0x088  SAT_COUNT   RO  number of saturated output samples (wraps)
++// ***************************************************************************
++// ***************************************************************************
++
++`timescale 1ns/100ps
++
++module axi_datv_xpdr #(
++
++  parameter ID = 0
++) (
++
++  // data interface (AD936x l_clk domain)
++
++  input                   clk,
++  input                   rst,
++
++  input                   rx_valid,
++  input       [15:0]      rx_data_i,
++  input       [15:0]      rx_data_q,
++
++  input       [15:0]      tx_in_data_i,
++  input       [15:0]      tx_in_data_q,
++  output      [15:0]      tx_out_data_i,
++  output      [15:0]      tx_out_data_q,
++
++  // axi interface
++
++  input                   s_axi_aclk,
++  input                   s_axi_aresetn,
++  input                   s_axi_awvalid,
++  input       [15:0]      s_axi_awaddr,
++  input       [ 2:0]      s_axi_awprot,
++  output                  s_axi_awready,
++  input                   s_axi_wvalid,
++  input       [31:0]      s_axi_wdata,
++  input       [ 3:0]      s_axi_wstrb,
++  output                  s_axi_wready,
++  output                  s_axi_bvalid,
++  output      [ 1:0]      s_axi_bresp,
++  input                   s_axi_bready,
++  input                   s_axi_arvalid,
++  input       [15:0]      s_axi_araddr,
++  input       [ 2:0]      s_axi_arprot,
++  output                  s_axi_arready,
++  output                  s_axi_rvalid,
++  output      [ 1:0]      s_axi_rresp,
++  output      [31:0]      s_axi_rdata,
++  input                   s_axi_rready
++);
++
++  localparam  [31:0]  CORE_VERSION = {16'h0001,   /* MAJOR */
++                                       8'h00,     /* MINOR */
++                                       8'h61};    /* PATCH */
++  localparam  [31:0]  CORE_MAGIC   = 32'h44415456; // DATV
++
++  // internal registers
++
++  reg                 up_wack = 'd0;
++  reg                 up_rack = 'd0;
++  reg     [31:0]      up_rdata = 'd0;
++  reg     [31:0]      up_scratch = 'd0;
++  reg     [ 2:0]      up_control = 'd0;
++  reg     [15:0]      up_gain = 16'h1000;
++  reg     [23:0]      up_sq_thresh = 'd0;
++  reg     [31:0]      up_sq_hang = 32'h00100000;
++  reg     [ 4:0]      up_avg_shift = 5'd10;
++
++  reg     [11:0]      s0_i = 'd0;
++  reg     [11:0]      s0_q = 'd0;
++  reg                 s0_valid = 'd0;
++  reg     [28:0]      s1_prod_i = 'd0;
++  reg     [28:0]      s1_prod_q = 'd0;
++  reg     [23:0]      s1_pwr_i = 'd0;
++  reg     [23:0]      s1_pwr_q = 'd0;
++  reg                 s1_valid = 'd0;
++  reg     [15:0]      s2_i = 'd0;
++  reg     [15:0]      s2_q = 'd0;
++  reg                 s2_sat = 'd0;
++  reg     [24:0]      s2_pwr = 'd0;
++  reg                 s2_valid = 'd0;
++  reg     [47:0]      d_pwr_acc = 'd0;
++  reg     [47:0]      d_pwr_acc_sh = 'd0;
++  reg     [23:0]      d_pwr_avg = 'd0;
++  reg     [31:0]      d_hang_cnt = 'd0;
++  reg                 d_sq_open = 'd0;
++  reg     [31:0]      d_sat_cnt = 'd0;
++  reg     [15:0]      d_out_i = 'd0;
++  reg     [15:0]      d_out_q = 'd0;
++
++  // internal signals
++
++  wire                up_clk;
++  wire                up_rstn;
++  wire                up_wreq_s;
++  wire    [13:0]      up_waddr_s;
++  wire    [31:0]      up_wdata_s;
++  wire                up_rreq_s;
++  wire    [13:0]      up_raddr_s;
++  wire    [57:0]      up_status_s;
++
++  wire                d_enable_s;
++  wire                d_sq_enable_s;
++  wire                d_force_mute_s;
++  wire    [15:0]      d_gain_s;
++  wire    [23:0]      d_sq_thresh_s;
++  wire    [31:0]      d_sq_hang_s;
++  wire    [ 4:0]      d_avg_shift_s;
++  wire    [20:0]      s1_scaled_i_s;
++  wire    [20:0]      s1_scaled_q_s;
++  wire                s1_sat_i_s;
++  wire                s1_sat_q_s;
++  wire                d_mute_s;
++
++  assign up_clk = s_axi_aclk;
++  assign up_rstn = s_axi_aresetn;
++
++  // ---------------------------------------------------------------------
++  // datapath
++  // ---------------------------------------------------------------------
++
++  // stage 0: capture the 12-bit two's complement samples
++
++  always @(posedge clk) begin
++    s0_valid <= rx_valid;
++    if (rx_valid == 1'b1) begin
++      s0_i <= rx_data_i[11:0];
++      s0_q <= rx_data_q[11:0];
++    end
++  end
++
++  // stage 1: gain (Q4.12) and instantaneous power
++
++  always @(posedge clk) begin
++    s1_valid <= s0_valid;
++    s1_prod_i <= $signed(s0_i) * $signed({1'b0, d_gain_s});
++    s1_prod_q <= $signed(s0_q) * $signed({1'b0, d_gain_s});
++    s1_pwr_i <= $signed(s0_i) * $signed(s0_i);
++    s1_pwr_q <= $signed(s0_q) * $signed(s0_q);
++  end
++
++  // stage 2: scale to the 16-bit DAC format (12-bit MSB aligned) and saturate
++  // x12 * gain / 2^12 * 2^4 = (x12 * gain) >> 8
++
++  assign s1_scaled_i_s = s1_prod_i[28:8];
++  assign s1_scaled_q_s = s1_prod_q[28:8];
++  assign s1_sat_i_s = (s1_scaled_i_s[20:15] != {6{s1_scaled_i_s[20]}});
++  assign s1_sat_q_s = (s1_scaled_q_s[20:15] != {6{s1_scaled_q_s[20]}});
++
++  always @(posedge clk) begin
++    s2_valid <= s1_valid;
++    s2_sat <= s1_valid & (s1_sat_i_s | s1_sat_q_s);
++    s2_pwr <= s1_pwr_i + s1_pwr_q;
++    if (s1_sat_i_s == 1'b1) begin
++      s2_i <= {s1_scaled_i_s[20], {15{~s1_scaled_i_s[20]}}};
++    end else begin
++      s2_i <= s1_scaled_i_s[15:0];
++    end
++    if (s1_sat_q_s == 1'b1) begin
++      s2_q <= {s1_scaled_q_s[20], {15{~s1_scaled_q_s[20]}}};
++    end else begin
++      s2_q <= s1_scaled_q_s[15:0];
++    end
++  end
++
++  // power averaging: acc += pwr - acc/2^n, avg = acc/2^n
++
++  always @(posedge clk) begin
++    if (rst == 1'b1) begin
++      d_pwr_acc <= 'd0;
++      d_pwr_acc_sh <= 'd0;
++      d_pwr_avg <= 'd0;
++    end else begin
++      d_pwr_acc_sh <= d_pwr_acc >> d_avg_shift_s;
++      if (s2_valid == 1'b1) begin
++        d_pwr_acc <= d_pwr_acc + s2_pwr - d_pwr_acc_sh;
++      end
++      d_pwr_avg <= (d_pwr_acc_sh[47:24] == 24'd0) ? d_pwr_acc_sh[23:0] : 24'hffffff;
++    end
++  end
++
++  // squelch with hang time
++
++  always @(posedge clk) begin
++    if (rst == 1'b1) begin
++      d_hang_cnt <= 'd0;
++      d_sq_open <= 1'b0;
++    end else if (d_sq_enable_s == 1'b0) begin
++      d_hang_cnt <= 'd0;
++      d_sq_open <= 1'b1;
++    end else if (d_pwr_avg >= d_sq_thresh_s) begin
++      d_hang_cnt <= d_sq_hang_s;
++      d_sq_open <= 1'b1;
++    end else if (d_hang_cnt != 32'd0) begin
++      if (s2_valid == 1'b1) begin
++        d_hang_cnt <= d_hang_cnt - 1'b1;
++      end
++    end else begin
++      d_sq_open <= 1'b0;
++    end
++  end
++
++  // output
++
++  assign d_mute_s = d_force_mute_s | ~d_sq_open;
++
++  always @(posedge clk) begin
++    if (rst == 1'b1) begin
++      d_out_i <= 'd0;
++      d_out_q <= 'd0;
++      d_sat_cnt <= 'd0;
++    end else begin
++      if (s2_valid == 1'b1) begin
++        d_out_i <= (d_mute_s == 1'b1) ? 16'd0 : s2_i;
++        d_out_q <= (d_mute_s == 1'b1) ? 16'd0 : s2_q;
++      end
++      if (s2_sat == 1'b1) begin
++        d_sat_cnt <= d_sat_cnt + 1'b1;
++      end
++    end
++  end
++
++  assign tx_out_data_i = (d_enable_s == 1'b1) ? d_out_i : tx_in_data_i;
++  assign tx_out_data_q = (d_enable_s == 1'b1) ? d_out_q : tx_in_data_q;
++
++  // ---------------------------------------------------------------------
++  // processor interface
++  // ---------------------------------------------------------------------
++
++  always @(posedge up_clk) begin
++    if (up_rstn == 1'b0) begin
++      up_wack <= 'd0;
++      up_scratch <= 'd0;
++      up_control <= 'd0;
++      up_gain <= 16'h1000;
++      up_sq_thresh <= 'd0;
++      up_sq_hang <= 32'h00100000;
++      up_avg_shift <= 5'd10;
++    end else begin
++      up_wack <= up_wreq_s;
++      if (up_wreq_s == 1'b1) begin
++        case (up_waddr_s)
++          14'h002: up_scratch <= up_wdata_s;
++          14'h010: up_control <= up_wdata_s[2:0];
++          14'h011: up_gain <= up_wdata_s[15:0];
++          14'h012: up_sq_thresh <= up_wdata_s[23:0];
++          14'h013: up_sq_hang <= up_wdata_s;
++          14'h014: up_avg_shift <= (up_wdata_s[4:0] > 5'd24) ? 5'd24 : up_wdata_s[4:0];
++          default: ;
++        endcase
++      end
++    end
++  end
++
++  always @(posedge up_clk) begin
++    if (up_rstn == 1'b0) begin
++      up_rack <= 'd0;
++      up_rdata <= 'd0;
++    end else begin
++      up_rack <= up_rreq_s;
++      if (up_rreq_s == 1'b1) begin
++        case (up_raddr_s)
++          14'h000: up_rdata <= CORE_VERSION;
++          14'h001: up_rdata <= ID;
++          14'h002: up_rdata <= up_scratch;
++          14'h003: up_rdata <= CORE_MAGIC;
++          14'h010: up_rdata <= {29'd0, up_control};
++          14'h011: up_rdata <= {16'd0, up_gain};
++          14'h012: up_rdata <= {8'd0, up_sq_thresh};
++          14'h013: up_rdata <= up_sq_hang;
++          14'h014: up_rdata <= {27'd0, up_avg_shift};
++          14'h020: up_rdata <= {30'd0, up_status_s[1:0]};
++          14'h021: up_rdata <= {8'd0, up_status_s[25:2]};
++          14'h022: up_rdata <= up_status_s[57:26];
++          default: up_rdata <= 'd0;
++        endcase
++      end else begin
++        up_rdata <= 'd0;
++      end
++    end
++  end
++
++  // clock domain crossing
++
++  up_xfer_cntrl #(
++    .DATA_WIDTH (80)
++  ) i_xfer_cntrl (
++    .up_rstn (up_rstn),
++    .up_clk (up_clk),
++    .up_data_cntrl ({up_avg_shift,
++                     up_sq_hang,
++                     up_sq_thresh,
++                     up_gain,
++                     up_control}),
++    .up_xfer_done (),
++    .d_rst (rst),
++    .d_clk (clk),
++    .d_data_cntrl ({d_avg_shift_s,
++                    d_sq_hang_s,
++                    d_sq_thresh_s,
++                    d_gain_s,
++                    d_force_mute_s,
++                    d_sq_enable_s,
++                    d_enable_s}));
++
++  up_xfer_status #(
++    .DATA_WIDTH (58)
++  ) i_xfer_status (
++    .up_rstn (up_rstn),
++    .up_clk (up_clk),
++    .up_data_status (up_status_s),
++    .d_rst (rst),
++    .d_clk (clk),
++    .d_data_status ({d_sat_cnt,
++                     d_pwr_avg,
++                     d_sq_open,
++                     d_enable_s}));
++
++  // axi interface
++
++  up_axi #(
++    .AXI_ADDRESS_WIDTH (16)
++  ) i_up_axi (
++    .up_rstn (up_rstn),
++    .up_clk (up_clk),
++    .up_axi_awvalid (s_axi_awvalid),
++    .up_axi_awaddr (s_axi_awaddr),
++    .up_axi_awready (s_axi_awready),
++    .up_axi_wvalid (s_axi_wvalid),
++    .up_axi_wdata (s_axi_wdata),
++    .up_axi_wstrb (s_axi_wstrb),
++    .up_axi_wready (s_axi_wready),
++    .up_axi_bvalid (s_axi_bvalid),
++    .up_axi_bresp (s_axi_bresp),
++    .up_axi_bready (s_axi_bready),
++    .up_axi_arvalid (s_axi_arvalid),
++    .up_axi_araddr (s_axi_araddr),
++    .up_axi_arready (s_axi_arready),
++    .up_axi_rvalid (s_axi_rvalid),
++    .up_axi_rresp (s_axi_rresp),
++    .up_axi_rdata (s_axi_rdata),
++    .up_axi_rready (s_axi_rready),
++    .up_wreq (up_wreq_s),
++    .up_waddr (up_waddr_s),
++    .up_wdata (up_wdata_s),
++    .up_wack (up_wack),
++    .up_rreq (up_rreq_s),
++    .up_raddr (up_raddr_s),
++    .up_rdata (up_rdata),
++    .up_rack (up_rack));
++
++endmodule
+diff --git a/library/axi_datv_xpdr/axi_datv_xpdr_ip.tcl b/library/axi_datv_xpdr/axi_datv_xpdr_ip.tcl
+new file mode 100644
+index 000000000..7fcb9907a
+--- /dev/null
++++ b/library/axi_datv_xpdr/axi_datv_xpdr_ip.tcl
+@@ -0,0 +1,19 @@
++# ip
++
++source ../../scripts/adi_env.tcl
++source $ad_hdl_dir/library/scripts/adi_ip_xilinx.tcl
++
++adi_ip_create axi_datv_xpdr
++adi_ip_files axi_datv_xpdr [list \
++  "$ad_hdl_dir/library/common/up_axi.v" \
++  "$ad_hdl_dir/library/common/up_xfer_cntrl.v" \
++  "$ad_hdl_dir/library/common/up_xfer_status.v" \
++  "$ad_hdl_dir/library/xilinx/common/up_xfer_cntrl_constr.xdc" \
++  "$ad_hdl_dir/library/xilinx/common/up_xfer_status_constr.xdc" \
++  "axi_datv_xpdr.v"]
++
++adi_ip_properties axi_datv_xpdr
++
++set cc [ipx::current_core]
++
++ipx::save_core $cc
+-- 
+2.43.0
+

@@ -1,0 +1,45 @@
+From f64762854df334fff94e8d1f018bf5a46796dd2f Mon Sep 17 00:00:00 2001
+From: Baris Dinc <barisdinc@gmail.com>
+Date: Sun, 11 Oct 2026 13:59:06 +0300
+Subject: [PATCH 3/4] board: pluto: Replace motd with the yATOLYE DATV Repeater
+ banner
+
+---
+ board/pluto/motd | 26 +++++++++++++++++---------
+ 1 file changed, 17 insertions(+), 9 deletions(-)
+
+diff --git a/board/pluto/motd b/board/pluto/motd
+index a3b3f6f664..dba842eadf 100644
+--- a/board/pluto/motd
++++ b/board/pluto/motd
+@@ -1,10 +1,18 @@
+ Welcome to:
+-______ _       _        _________________
+-| ___ \ |     | |      /  ___|  _  \ ___ \
+-| |_/ / |_   _| |_ ___ \ `--.| | | | |_/ /
+-|  __/| | | | | __/ _ \ `--. \ | | |    /
+-| |   | | |_| | || (_) /\__/ / |/ /| |\ \
+-\_|   |_|\__,_|\__\___/\____/|___/ \_| \_|
+-
+-#BUILD#
+-https://wiki.analog.com/university/tools/pluto
++        _____  _____  _____  _   _     _  ___   
++       (  _  )(_   _)(  _  )( ) ( )   ( )(  _`\ 
++ _   _ | (_) |  | |  | ( ) || | `\`\_/'/'| (_(_)
++( ) ( )|  _  |  | |  | | | || |  _`\ /'  |  _)_ 
++| (_) || | | |  | |  | (_) || |_( )| |   | (_( )
++`\__, |(_) (_)  (_)  (_____)(____/'(_)   (____/'
++( )_| |                                         
++`\___/'                                         
++ ___    _____  _____  _   _                     
++(  _`\ (  _  )(_   _)( ) ( )                    
++| | ) || (_) |  | |  | | | |                    
++| | | )|  _  |  | |  | | | |                    
++| |_) || | | |  | |  | \_/ |                    
++(____/'(_) (_)  (_)  `\___/'                    
++                                                
++-= yeniden ATOLYE DATV Repeater Project =-                                                                                                                                      
++                                                                                      
+-- 
+2.43.0
+

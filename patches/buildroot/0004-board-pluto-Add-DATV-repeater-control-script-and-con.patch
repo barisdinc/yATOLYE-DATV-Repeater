@@ -1,0 +1,393 @@
+From 098e2454945981492990e08b9226b346c9022217 Mon Sep 17 00:00:00 2001
+From: Baris Dinc <barisdinc@gmail.com>
+Date: Sun, 11 Oct 2026 13:59:06 +0300
+Subject: [PATCH 4/4] board: pluto: Add DATV repeater control script and
+ configuration
+
+Add datv_repeater, which configures the AD936x and the axi_datv_xpdr
+FPGA core from /etc/datv.conf, optionally overridden by the persistent
+/mnt/jffs2/datv.conf:
+
+- RX LO (2300 - 2450 MHz) and TX LO (5650 - 5850 MHz)
+- channel bandwidth and baseband sample rate
+- RX gain control mode (manual, slow_attack, fast_attack, hybrid) and
+  manual RX gain
+- TX attenuation
+- FPGA digital gain, squelch threshold, hang time and power averaging
+
+The script supports start, stop, restart and status. The configuration
+is validated before it is applied and the TX is muted while the device
+is being reconfigured.
+
+S60datv starts the repeater at boot.
+---
+ board/pluto/S60datv       |  16 +++
+ board/pluto/datv.conf     |  47 +++++++
+ board/pluto/datv_repeater | 256 ++++++++++++++++++++++++++++++++++++++
+ board/pluto/post-build.sh |   3 +
+ 4 files changed, 322 insertions(+)
+ create mode 100755 board/pluto/S60datv
+ create mode 100644 board/pluto/datv.conf
+ create mode 100755 board/pluto/datv_repeater
+
+diff --git a/board/pluto/S60datv b/board/pluto/S60datv
+new file mode 100755
+index 0000000000..68748db490
+--- /dev/null
++++ b/board/pluto/S60datv
+@@ -0,0 +1,16 @@
++#!/bin/sh
++#
++# Start the yATOLYE DATV repeater
++#
++
++case "$1" in
++	start|stop|restart|status)
++		/usr/sbin/datv_repeater "$1"
++		;;
++	reload)
++		/usr/sbin/datv_repeater restart
++		;;
++	*)
++		echo "Usage: $0 {start|stop|restart|reload|status}"
++		exit 1
++esac
+diff --git a/board/pluto/datv.conf b/board/pluto/datv.conf
+new file mode 100644
+index 0000000000..ed07830eed
+--- /dev/null
++++ b/board/pluto/datv.conf
+@@ -0,0 +1,47 @@
++# yATOLYE DATV Repeater configuration
++#
++# Defaults live in /etc/datv.conf (read-only, part of the firmware image).
++# To override persistently, copy this file to /mnt/jffs2/datv.conf and edit:
++#   cp /etc/datv.conf /mnt/jffs2/datv.conf
++# Apply changes without reboot with: datv_repeater restart
++
++[DATV]
++# 1 = repeater on (TX fed from RX), 0 = off (TX muted)
++enable = 1
++
++# Receive (input) centre frequency, 2300 - 2450 MHz
++rx_freq_mhz = 2400
++
++# Transmit (output) centre frequency, 5650 - 5850 MHz
++tx_freq_mhz = 5760
++
++# Channel bandwidth in MHz (RX and TX analog filters), 0.2 - 20
++bandwidth_mhz = 10
++
++# Baseband sample rate in MSPS, 0 = auto (1.25 x bandwidth, min 2.5)
++sample_rate_msps = 0
++
++# RX gain control: manual | slow_attack | fast_attack | hybrid
++rx_gain_mode = slow_attack
++
++# RX gain in dB, used only when rx_gain_mode = manual (-3 .. 71)
++rx_gain_db = 40
++
++# TX attenuation in dB, 0 = maximum output power (0 .. 89.75)
++tx_attenuation_db = 10
++
++# Digital gain applied in the FPGA between RX and TX, in dB (-40 .. 24)
++digital_gain_db = 0
++
++# Squelch: mute TX when the received power is below the threshold
++# 1 = on, 0 = off (TX always relays)
++squelch = 0
++
++# Squelch threshold in dBFS (0 dBFS = full-scale complex sinusoid)
++squelch_dbfs = -40
++
++# Keep TX on for this long after the signal drops below the threshold
++squelch_hang_ms = 500
++
++# Power detector averaging, time constant = 2^n samples (0 .. 24)
++power_avg_shift = 10
+diff --git a/board/pluto/datv_repeater b/board/pluto/datv_repeater
+new file mode 100755
+index 0000000000..d3146c4791
+--- /dev/null
++++ b/board/pluto/datv_repeater
+@@ -0,0 +1,256 @@
++#!/bin/sh
++#
++# yATOLYE DATV repeater control
++#
++# Configures the AD936x (RX/TX LO, bandwidth, gain) and the axi_datv_xpdr
++# FPGA core from /etc/datv.conf (overridden by /mnt/jffs2/datv.conf).
++#
++# usage: datv_repeater {start|stop|restart|status}
++
++CONF_DEFAULT=/etc/datv.conf
++CONF_USER=/mnt/jffs2/datv.conf
++
++PHY=ad9361-phy
++DDS=cf-ad9361-dds-core-lpc
++
++XPDR_BASE=0x7C450000
++XPDR_MAGIC=0x44415456
++
++REG_MAGIC=0x00C
++REG_CONTROL=0x040
++REG_GAIN=0x044
++REG_SQ_THRESH=0x048
++REG_SQ_HANG=0x04C
++REG_AVG_SHIFT=0x050
++REG_STATUS=0x080
++REG_POWER=0x084
++REG_SAT_COUNT=0x088
++
++# DAC channel data select: 0 = DDS, 2 = DMA/fabric (fed by axi_datv_xpdr)
++DDS_SEL_I=0x418
++DDS_SEL_Q=0x458
++
++# 0.1 dB steps: amplitude 10^(0.1/20), power 10^(0.1/10)
++STEP_AMP=1.0115794542598986
++STEP_PWR=1.0232929922807541
++
++# full-scale complex sinusoid of 12-bit samples: 2048^2
++PWR_FS=4194304
++
++log() {
++	echo "datv: $*"
++	logger -t datv "$*"
++}
++
++die() {
++	log "ERROR: $*"
++	exit 1
++}
++
++xpdr_wr() {
++	devmem $(printf 0x%08X $((XPDR_BASE + $1))) 32 $2
++}
++
++xpdr_rd() {
++	devmem $(printf 0x%08X $((XPDR_BASE + $1))) 32
++}
++
++phy_attr() {
++	# phy_attr <-i|-o> <channel> <attr> [value]
++	iio_attr $1 -c $PHY $2 $3 $4 2>/dev/null
++}
++
++# exit 0 if $1 is a number within [$2, $3]
++in_range() {
++	awk -v v="$1" -v lo="$2" -v hi="$3" \
++		'BEGIN { exit !(v ~ /^[-+]?[0-9]+(\.[0-9]+)?$/ && v + 0 >= lo && v + 0 <= hi) }'
++}
++
++# linear factor for a dB value, 0.1 dB resolution
++# db2lin <db> <step>
++db2lin() {
++	awk -v db="$1" -v s="$2" 'BEGIN {
++		n = int(db * 10 + (db < 0 ? -0.5 : 0.5)); x = 1
++		if (n < 0) { n = -n; s = 1 / s }
++		for (i = 0; i < n; i++) x *= s
++		printf "%.9f", x }'
++}
++
++# dB value of a linear ratio, 0.1 dB resolution
++# lin2db <ratio> <step>
++lin2db() {
++	awk -v x="$1" -v s="$2" 'BEGIN {
++		if (x <= 0) { print "-inf"; exit }
++		n = 0
++		while (x >= s * 0.9999999) { x /= s; n++ }
++		while (x < 0.9999999) { x *= s; n-- }
++		printf "%.1f", n / 10 }'
++}
++
++load_conf() {
++	cfg_enable=1
++	cfg_rx_freq_mhz=2400
++	cfg_tx_freq_mhz=5760
++	cfg_bandwidth_mhz=10
++	cfg_sample_rate_msps=0
++	cfg_rx_gain_mode=slow_attack
++	cfg_rx_gain_db=40
++	cfg_tx_attenuation_db=10
++	cfg_digital_gain_db=0
++	cfg_squelch=0
++	cfg_squelch_dbfs=-40
++	cfg_squelch_hang_ms=500
++	cfg_power_avg_shift=10
++
++	CONF_USED=
++	for f in $CONF_DEFAULT $CONF_USER; do
++		[ -f $f ] || continue
++		CONF_USED="$CONF_USED $f"
++		# only plain key=value pairs of the [DATV] section, values limited
++		# to a safe character set so the result can be eval'd
++		eval "$(awk '
++			{ sub(/\r$/, "") }
++			/^[ \t]*\[/ { sec = $0; gsub(/[][ \t]/, "", sec); next }
++			sec != "DATV" { next }
++			{ sub(/[#;].*$/, ""); gsub(/[ \t]/, "") }
++			/^[a-z_][a-z0-9_]*=[A-Za-z0-9_.+-]+$/ { print "cfg_" $0 }
++		' $f)"
++	done
++}
++
++check_conf() {
++	in_range "$cfg_enable" 0 1 || die "enable must be 0 or 1"
++	in_range "$cfg_rx_freq_mhz" 2300 2450 || die "rx_freq_mhz must be 2300 - 2450"
++	in_range "$cfg_tx_freq_mhz" 5650 5850 || die "tx_freq_mhz must be 5650 - 5850"
++	in_range "$cfg_bandwidth_mhz" 0.2 20 || die "bandwidth_mhz must be 0.2 - 20"
++	in_range "$cfg_sample_rate_msps" 0 61.44 || die "sample_rate_msps must be 0 - 61.44"
++	case "$cfg_rx_gain_mode" in
++		manual|slow_attack|fast_attack|hybrid) ;;
++		*) die "rx_gain_mode must be manual, slow_attack, fast_attack or hybrid" ;;
++	esac
++	in_range "$cfg_rx_gain_db" -3 71 || die "rx_gain_db must be -3 - 71"
++	in_range "$cfg_tx_attenuation_db" 0 89.75 || die "tx_attenuation_db must be 0 - 89.75"
++	in_range "$cfg_digital_gain_db" -40 24 || die "digital_gain_db must be -40 - 24"
++	in_range "$cfg_squelch" 0 1 || die "squelch must be 0 or 1"
++	in_range "$cfg_squelch_dbfs" -90 0 || die "squelch_dbfs must be -90 - 0"
++	in_range "$cfg_squelch_hang_ms" 0 60000 || die "squelch_hang_ms must be 0 - 60000"
++	in_range "$cfg_power_avg_shift" 0 24 || die "power_avg_shift must be 0 - 24"
++}
++
++check_core() {
++	[ "$(xpdr_rd $REG_MAGIC)" = "$XPDR_MAGIC" ] || \
++		die "axi_datv_xpdr core not found at $XPDR_BASE (wrong FPGA image?)"
++}
++
++start() {
++	load_conf
++	check_conf
++	check_core
++	log "config:$CONF_USED"
++
++	rx_hz=$(awk -v m=$cfg_rx_freq_mhz 'BEGIN { printf "%.0f", m * 1e6 }')
++	tx_hz=$(awk -v m=$cfg_tx_freq_mhz 'BEGIN { printf "%.0f", m * 1e6 }')
++	bw_hz=$(awk -v m=$cfg_bandwidth_mhz 'BEGIN { printf "%.0f", m * 1e6 }')
++	fs_hz=$(awk -v m=$cfg_sample_rate_msps -v bw=$bw_hz 'BEGIN {
++		fs = (m > 0) ? m * 1e6 : bw * 1.25
++		if (fs < 2.5e6) fs = 2.5e6
++		if (fs > 61.44e6) fs = 61.44e6
++		printf "%.0f", fs }')
++
++	# mute while reconfiguring
++	xpdr_wr $REG_CONTROL 0x4
++	phy_attr -o voltage0 hardwaregain -89.75
++
++	iio_attr -d $PHY ensm_mode fdd >/dev/null 2>&1
++	phy_attr -o altvoltage0 frequency $rx_hz >/dev/null || die "RX LO $rx_hz"
++	phy_attr -o altvoltage1 frequency $tx_hz >/dev/null || die "TX LO $tx_hz"
++	phy_attr -i voltage0 sampling_frequency $fs_hz >/dev/null || die "sample rate $fs_hz"
++	phy_attr -i voltage0 rf_bandwidth $bw_hz >/dev/null || die "RX bandwidth $bw_hz"
++	phy_attr -o voltage0 rf_bandwidth $bw_hz >/dev/null || die "TX bandwidth $bw_hz"
++	phy_attr -i voltage0 gain_control_mode $cfg_rx_gain_mode >/dev/null || die "gain mode"
++	if [ "$cfg_rx_gain_mode" = "manual" ]; then
++		phy_attr -i voltage0 hardwaregain $cfg_rx_gain_db >/dev/null || die "RX gain"
++	fi
++
++	# TX I0/Q0 from the fabric (axi_datv_xpdr) instead of the DDS
++	iio_reg $DDS $DDS_SEL_I 2 >/dev/null || die "DAC data select"
++	iio_reg $DDS $DDS_SEL_Q 2 >/dev/null || die "DAC data select"
++
++	gain=$(awk -v l=$(db2lin $cfg_digital_gain_db $STEP_AMP) 'BEGIN {
++		g = int(4096 * l + 0.5); if (g > 65535) g = 65535; printf "%d", g }')
++	thresh=$(awk -v l=$(db2lin $cfg_squelch_dbfs $STEP_PWR) -v fs=$PWR_FS 'BEGIN {
++		t = int(fs * l + 0.5); if (t < 1) t = 1; if (t > 16777215) t = 16777215
++		printf "%d", t }')
++	hang=$(awk -v ms=$cfg_squelch_hang_ms -v fs=$fs_hz 'BEGIN {
++		printf "%.0f", ms * fs / 1000 }')
++
++	xpdr_wr $REG_GAIN $gain
++	xpdr_wr $REG_SQ_THRESH $thresh
++	xpdr_wr $REG_SQ_HANG $hang
++	xpdr_wr $REG_AVG_SHIFT $cfg_power_avg_shift
++
++	if [ "$cfg_enable" = "1" ]; then
++		xpdr_wr $REG_CONTROL $((1 | cfg_squelch << 1))
++		phy_attr -o voltage0 hardwaregain -$cfg_tx_attenuation_db >/dev/null || die "TX attenuation"
++		log "started: RX $cfg_rx_freq_mhz MHz -> TX $cfg_tx_freq_mhz MHz," \
++			"BW $cfg_bandwidth_mhz MHz, fs $fs_hz Hz, RX $cfg_rx_gain_mode," \
++			"TX att $cfg_tx_attenuation_db dB, dgain $cfg_digital_gain_db dB," \
++			"squelch $cfg_squelch ($cfg_squelch_dbfs dBFS)"
++	else
++		log "disabled in config, TX muted"
++	fi
++}
++
++stop() {
++	check_core
++	xpdr_wr $REG_CONTROL 0x0
++	phy_attr -o voltage0 hardwaregain -89.75 >/dev/null
++	iio_reg $DDS $DDS_SEL_I 0 >/dev/null
++	iio_reg $DDS $DDS_SEL_Q 0 >/dev/null
++	log "stopped, TX muted"
++}
++
++status() {
++	check_core
++	st=$(xpdr_rd $REG_STATUS)
++	pwr=$(xpdr_rd $REG_POWER)
++	sat=$(xpdr_rd $REG_SAT_COUNT)
++	ratio=$(awk -v p=$((pwr)) -v fs=$PWR_FS 'BEGIN { printf "%.9f", p / fs }')
++
++	echo "RX LO:        $(phy_attr -o altvoltage0 frequency) Hz"
++	echo "TX LO:        $(phy_attr -o altvoltage1 frequency) Hz"
++	echo "sample rate:  $(phy_attr -i voltage0 sampling_frequency) Hz"
++	echo "RX bandwidth: $(phy_attr -i voltage0 rf_bandwidth) Hz"
++	echo "RX gain:      $(phy_attr -i voltage0 gain_control_mode), $(phy_attr -i voltage0 hardwaregain)"
++	echo "RX RSSI:      $(phy_attr -i voltage0 rssi)"
++	echo "TX gain:      $(phy_attr -o voltage0 hardwaregain)"
++	if [ $((st & 1)) -eq 1 ]; then
++		echo "repeater:     enabled"
++		echo "TX output:    $( [ $((st & 2)) -eq 2 ] && echo active || echo muted )"
++	else
++		echo "repeater:     disabled"
++		echo "TX output:    not fed from RX"
++	fi
++	echo "input power:  $(lin2db $ratio $STEP_PWR) dBFS"
++	echo "saturations:  $((sat))"
++}
++
++case "$1" in
++	start)
++		start
++		;;
++	stop)
++		stop
++		;;
++	restart|reload)
++		stop
++		start
++		;;
++	status)
++		status
++		;;
++	*)
++		echo "usage: $0 {start|stop|restart|status}"
++		exit 1
++		;;
++esac
+diff --git a/board/pluto/post-build.sh b/board/pluto/post-build.sh
+index 03021a4918..0fb40774fe 100755
+--- a/board/pluto/post-build.sh
++++ b/board/pluto/post-build.sh
+@@ -65,6 +65,7 @@ ${INSTALL} -D -m 0755 ${BOARD_DIR}/S23udc ${TARGET_DIR}/etc/init.d/
+ ${INSTALL} -D -m 0755 ${BOARD_DIR}/S40network ${TARGET_DIR}/etc/init.d/
+ ${INSTALL} -D -m 0755 ${BOARD_DIR}/S41network ${TARGET_DIR}/etc/init.d/
+ ${INSTALL} -D -m 0755 ${BOARD_DIR}/S45msd ${TARGET_DIR}/etc/init.d/
++${INSTALL} -D -m 0755 ${BOARD_DIR}/S60datv ${TARGET_DIR}/etc/init.d/
+ ${INSTALL} -D -m 0755 ${BOARD_DIR}/S98autostart ${TARGET_DIR}/etc/init.d/
+ ${INSTALL} -D -m 0644 ${BOARD_DIR}/fw_env.config ${TARGET_DIR}/etc/
+ ${INSTALL} -D -m 0644 ${BOARD_DIR}/VERSIONS ${TARGET_DIR}/opt/
+@@ -73,6 +74,8 @@ ${INSTALL} -D -m 0755 ${BOARD_DIR}/device_passwd ${TARGET_DIR}/usr/sbin/
+ ${INSTALL} -D -m 0755 ${BOARD_DIR}/device_persistent_keys ${TARGET_DIR}/usr/sbin/
+ ${INSTALL} -D -m 0755 ${BOARD_DIR}/device_format_jffs2 ${TARGET_DIR}/usr/sbin/
+ ${INSTALL} -D -m 0644 ${BOARD_DIR}/motd ${TARGET_DIR}/etc/
++${INSTALL} -D -m 0644 ${BOARD_DIR}/datv.conf ${TARGET_DIR}/etc/
++${INSTALL} -D -m 0755 ${BOARD_DIR}/datv_repeater ${TARGET_DIR}/usr/sbin/
+ ${INSTALL} -D -m 0755 ${BOARD_DIR}/test_ensm_pinctrl.sh ${TARGET_DIR}/usr/sbin/
+ ${INSTALL} -D -m 0644 ${BOARD_DIR}/device_config ${TARGET_DIR}/etc/
+ ${INSTALL} -D -m 0644 ${BOARD_DIR}/mdev.conf ${TARGET_DIR}/etc/
+-- 
+2.43.0
+

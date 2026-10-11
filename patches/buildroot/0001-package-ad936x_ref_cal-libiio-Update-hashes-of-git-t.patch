@@ -1,0 +1,40 @@
+From e0a1a57cf84db9a13035f41441925538da065957 Mon Sep 17 00:00:00 2001
+From: Baris Dinc <barisdinc@gmail.com>
+Date: Sun, 11 Oct 2026 13:59:06 +0300
+Subject: [PATCH 1/4] package: ad936x_ref_cal, libiio: Update hashes of git
+ tarballs
+
+The tarballs that Buildroot generates from the git sources of these
+packages no longer match the recorded hashes, which makes the download
+step fail. Update the hashes to the currently generated archives.
+---
+ package/ad936x_ref_cal/ad936x_ref_cal.hash | 2 +-
+ package/libiio/libiio.hash                 | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/package/ad936x_ref_cal/ad936x_ref_cal.hash b/package/ad936x_ref_cal/ad936x_ref_cal.hash
+index 24eb7fb88b..ca5798774c 100644
+--- a/package/ad936x_ref_cal/ad936x_ref_cal.hash
++++ b/package/ad936x_ref_cal/ad936x_ref_cal.hash
+@@ -1,5 +1,5 @@
+ # Locally computed
+-sha256 26aedd8021fa939ab2f53e55904d869207265242fef7ad86aa4673e219b7cbef ad936x_ref_cal-01747db5cd60ff64115a73ac1f3bb97911f5c58e-br1.tar.gz
++sha256 4814915de63d975807e918df82bb86021d0e78839e8cc4116a36476d0b33180c ad936x_ref_cal-01747db5cd60ff64115a73ac1f3bb97911f5c58e-br1.tar.gz
+ 
+ # License files (locally computed as well)
+ sha256 8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643 LICENSE
+diff --git a/package/libiio/libiio.hash b/package/libiio/libiio.hash
+index f1c58efb5e..56a9cba5e5 100644
+--- a/package/libiio/libiio.hash
++++ b/package/libiio/libiio.hash
+@@ -1,6 +1,6 @@
+ # Locally calculated
+ sha256 a2b5d848531ea64fd9f95327dfd5a588bd227d9577281ec375e822702c6a52d5  libiio-0.24.tar.gz
+ sha256 21972599a3c143ab1f98002ad2b3f28f4aff927fde5f677478311cd4e517730c  libiio-0.25.tar.gz
+-sha256 e791ad1cf35aef08fc6e2b6b0dcdd1cc21d36cf287d81fa14adb088c6c1d4c49  libiio-38483f31be391af66b35542f733e569febe13d3a-br1.tar.gz
++sha256 865fe496624bebc7c4266bf157fb4b5ec851b5f929d2571ec73846e4f317cf46  libiio-38483f31be391af66b35542f733e569febe13d3a-br1.tar.gz
+ sha256 102900208eef27b766380135906d431dba87edaa7ec6aa72e6ebd3dd67f3a97b  COPYING.txt
+ 
+-- 
+2.43.0
+
