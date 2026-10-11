@@ -1,0 +1,37 @@
+From 5d559f91ec202afd96b65c9e00d98e9c056b2b20 Mon Sep 17 00:00:00 2001
+From: Baris Dinc <barisdinc@gmail.com>
+Date: Sun, 11 Oct 2026 19:51:45 +0300
+Subject: [PATCH 4/4] projects: pluto: Clock the axi_datv_xpdr beacon NCO with
+ the DAC valid
+
+Connect dac_valid_i0 to the new tx_valid input of axi_datv_xpdr, so the
+beacon NCO advances once per DAC sample.
+---
+ projects/pluto/system_bd.tcl | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/projects/pluto/system_bd.tcl b/projects/pluto/system_bd.tcl
+index 4720b92cf..ceaa09e52 100644
+--- a/projects/pluto/system_bd.tcl
++++ b/projects/pluto/system_bd.tcl
+@@ -277,7 +277,8 @@ ad_connect axi_ad9361/dac_valid_i0 tx_fir_interpolator/dac_valid_0
+ ad_connect axi_ad9361/dac_enable_q0 tx_fir_interpolator/dac_enable_1
+ ad_connect axi_ad9361/dac_valid_q0 tx_fir_interpolator/dac_valid_1
+ 
+-# datv repeater: RX I0/Q0 -> gain/squelch -> TX I0/Q0 (bypassed when disabled)
++# datv repeater: RX I0/Q0 -> gain/squelch -> TX I0/Q0, plus the NCO shifted
++# DMA data (beacon); bypassed when both are disabled
+ 
+ ad_ip_instance axi_datv_xpdr datv_xpdr
+ 
+@@ -286,6 +287,7 @@ ad_connect axi_ad9361/rst datv_xpdr/rst
+ ad_connect axi_ad9361/adc_valid_i0 datv_xpdr/rx_valid
+ ad_connect axi_ad9361/adc_data_i0 datv_xpdr/rx_data_i
+ ad_connect axi_ad9361/adc_data_q0 datv_xpdr/rx_data_q
++ad_connect axi_ad9361/dac_valid_i0 datv_xpdr/tx_valid
+ ad_connect tx_fir_interpolator/data_out_0 datv_xpdr/tx_in_data_i
+ ad_connect tx_fir_interpolator/data_out_1 datv_xpdr/tx_in_data_q
+ ad_connect datv_xpdr/tx_out_data_i axi_ad9361/dac_data_i0
+-- 
+2.43.0
+

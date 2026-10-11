@@ -1,7 +1,7 @@
 From f64762854df334fff94e8d1f018bf5a46796dd2f Mon Sep 17 00:00:00 2001
 From: Baris Dinc <barisdinc@gmail.com>
 Date: Sun, 11 Oct 2026 13:59:06 +0300
-Subject: [PATCH 3/4] board: pluto: Replace motd with the yATOLYE DATV Repeater
+Subject: [PATCH 3/6] board: pluto: Replace motd with the yATOLYE DATV Repeater
  banner
 
 ---

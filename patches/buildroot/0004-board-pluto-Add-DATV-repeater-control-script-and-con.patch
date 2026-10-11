@@ -1,7 +1,7 @@
 From 098e2454945981492990e08b9226b346c9022217 Mon Sep 17 00:00:00 2001
 From: Baris Dinc <barisdinc@gmail.com>
 Date: Sun, 11 Oct 2026 13:59:06 +0300
-Subject: [PATCH 4/4] board: pluto: Add DATV repeater control script and
+Subject: [PATCH 4/6] board: pluto: Add DATV repeater control script and
  configuration
 
 Add datv_repeater, which configures the AD936x and the axi_datv_xpdr

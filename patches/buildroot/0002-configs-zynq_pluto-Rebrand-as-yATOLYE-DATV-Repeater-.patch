@@ -1,7 +1,7 @@
 From 3d1fe557be777874b234fcf2b456947189bdc24e Mon Sep 17 00:00:00 2001
 From: Baris Dinc <barisdinc@gmail.com>
 Date: Sun, 11 Oct 2026 13:59:06 +0300
-Subject: [PATCH 2/4] configs: zynq_pluto: Rebrand as yATOLYE DATV Repeater,
+Subject: [PATCH 2/6] configs: zynq_pluto: Rebrand as yATOLYE DATV Repeater,
  add ffmpeg and lame
 
 Set the hostname to atolye-datv-repeater and the login banner to

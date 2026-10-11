@@ -1,0 +1,1499 @@
+From eabd09f3fc02b32f6b990066cc732992396403ce Mon Sep 17 00:00:00 2001
+From: Baris Dinc <barisdinc@gmail.com>
+Date: Sun, 11 Oct 2026 19:51:45 +0300
+Subject: [PATCH 3/4] library: axi_datv_xpdr: Add an NCO shifted beacon path
+
+Add a second TX source next to the repeater: the DMA/interpolator data is
+shifted by an NCO and added to the repeater output with saturation, so a
+locally generated signal (DVB-S2 beacon) can be transmitted in the same
+channel as the relayed one.
+
+The NCO uses a quarter wave sine table in block RAM, addressed with the
+12 MSBs of a 32-bit phase accumulator (spurs below -72 dBc), and a complex
+mixer on 4 DSP slices. A CORDIC was tried first but needs ~1500 LUTs,
+which do not fit into the Zynq-7010 next to the Pluto design.
+
+New registers:
+  0x040 CONTROL     [3] beacon enable
+  0x054 BEACON_FREQ NCO phase increment, f = fs * n / 2^32 (signed)
+  0x080 STATUS      [2] beacon enable
+
+The squelch and the force mute only act on the repeater path. With both
+paths disabled the DMA data is passed through unchanged as before. A new
+tx_valid input advances the NCO once per DAC sample.
+---
+ library/axi_datv_xpdr/Makefile             |    1 +
+ library/axi_datv_xpdr/axi_datv_xpdr.v      |   95 +-
+ library/axi_datv_xpdr/axi_datv_xpdr_ip.tcl |    1 +
+ library/axi_datv_xpdr/datv_nco_mixer.v     | 1206 ++++++++++++++++++++
+ 4 files changed, 1287 insertions(+), 16 deletions(-)
+ create mode 100644 library/axi_datv_xpdr/datv_nco_mixer.v
+
+diff --git a/library/axi_datv_xpdr/Makefile b/library/axi_datv_xpdr/Makefile
+index 216b927d2..f4ec900ef 100644
+--- a/library/axi_datv_xpdr/Makefile
++++ b/library/axi_datv_xpdr/Makefile
+@@ -8,6 +8,7 @@ LIBRARY_NAME := axi_datv_xpdr
+ GENERIC_DEPS += ../common/up_axi.v
+ GENERIC_DEPS += ../common/up_xfer_cntrl.v
+ GENERIC_DEPS += ../common/up_xfer_status.v
++GENERIC_DEPS += datv_nco_mixer.v
+ GENERIC_DEPS += axi_datv_xpdr.v
+ 
+ XILINX_DEPS += ../xilinx/common/up_xfer_cntrl_constr.xdc
+diff --git a/library/axi_datv_xpdr/axi_datv_xpdr.v b/library/axi_datv_xpdr/axi_datv_xpdr.v
+index 2e2f6cf4b..63c1e57bb 100644
+--- a/library/axi_datv_xpdr/axi_datv_xpdr.v
++++ b/library/axi_datv_xpdr/axi_datv_xpdr.v
+@@ -7,6 +7,12 @@
+ // is done by the independent RX/TX LOs of the AD936x; this core only applies
+ // a digital gain with saturation and a power based squelch.
+ //
++// Beacon: when enabled, the DMA/interpolator data is shifted by an NCO
++// (BEACON_FREQ) and added to the repeater output, so a locally generated
++// signal can be transmitted next to the relayed one. The squelch and the
++// force mute only affect the repeater path. With both the repeater and the
++// beacon disabled the DMA/interpolator data is passed through unchanged.
++//
+ // Register map (byte offsets):
+ //   0x000  VERSION     RO
+ //   0x004  ID          RO
+@@ -15,11 +21,15 @@
+ //   0x040  CONTROL     RW  [0] enable (TX fed from RX)
+ //                          [1] squelch enable
+ //                          [2] force mute
++//                          [3] beacon enable (TX += NCO shifted DMA data)
+ //   0x044  GAIN        RW  [15:0] unsigned Q4.12, 0x1000 = 0 dB (ADC FS -> DAC FS)
+ //   0x048  SQ_THRESH   RW  [23:0] squelch open threshold, compared to POWER
+ //   0x04C  SQ_HANG     RW  [31:0] squelch hang time in samples
+ //   0x050  AVG_SHIFT   RW  [4:0]  power averaging, IIR time constant 2^n samples
+-//   0x080  STATUS      RO  [0] enable, [1] squelch open (TX active)
++//   0x054  BEACON_FREQ RW  [31:0] beacon NCO phase increment, f = fs * n / 2^32
++//                          (signed, n < 0 shifts the beacon down)
++//   0x080  STATUS      RO  [0] enable, [1] squelch open (TX active),
++//                          [2] beacon enable
+ //   0x084  POWER       RO  [23:0] averaged I^2+Q^2 (12-bit samples)
+ //   0x088  SAT_COUNT   RO  number of saturated output samples (wraps)
+ // ***************************************************************************
+@@ -41,6 +51,7 @@ module axi_datv_xpdr #(
+   input       [15:0]      rx_data_i,
+   input       [15:0]      rx_data_q,
+ 
++  input                   tx_valid,
+   input       [15:0]      tx_in_data_i,
+   input       [15:0]      tx_in_data_q,
+   output      [15:0]      tx_out_data_i,
+@@ -72,7 +83,7 @@ module axi_datv_xpdr #(
+ );
+ 
+   localparam  [31:0]  CORE_VERSION = {16'h0001,   /* MAJOR */
+-                                       8'h00,     /* MINOR */
++                                       8'h01,     /* MINOR */
+                                        8'h61};    /* PATCH */
+   localparam  [31:0]  CORE_MAGIC   = 32'h44415456; // DATV
+ 
+@@ -82,11 +93,12 @@ module axi_datv_xpdr #(
+   reg                 up_rack = 'd0;
+   reg     [31:0]      up_rdata = 'd0;
+   reg     [31:0]      up_scratch = 'd0;
+-  reg     [ 2:0]      up_control = 'd0;
++  reg     [ 3:0]      up_control = 'd0;
+   reg     [15:0]      up_gain = 16'h1000;
+   reg     [23:0]      up_sq_thresh = 'd0;
+   reg     [31:0]      up_sq_hang = 32'h00100000;
+   reg     [ 4:0]      up_avg_shift = 5'd10;
++  reg     [31:0]      up_beacon_freq = 'd0;
+ 
+   reg     [11:0]      s0_i = 'd0;
+   reg     [11:0]      s0_q = 'd0;
+@@ -109,6 +121,9 @@ module axi_datv_xpdr #(
+   reg     [31:0]      d_sat_cnt = 'd0;
+   reg     [15:0]      d_out_i = 'd0;
+   reg     [15:0]      d_out_q = 'd0;
++  reg     [15:0]      d_sum_i = 'd0;
++  reg     [15:0]      d_sum_q = 'd0;
++  reg                 d_sum_sat = 'd0;
+ 
+   // internal signals
+ 
+@@ -119,9 +134,19 @@ module axi_datv_xpdr #(
+   wire    [31:0]      up_wdata_s;
+   wire                up_rreq_s;
+   wire    [13:0]      up_raddr_s;
+-  wire    [57:0]      up_status_s;
++  wire    [58:0]      up_status_s;
+ 
+   wire                d_enable_s;
++  wire                d_beacon_s;
++  wire    [31:0]      d_beacon_freq_s;
++  wire                b_valid_s;
++  wire    [15:0]      b_i_s;
++  wire    [15:0]      b_q_s;
++  wire                b_sat_s;
++  wire    [16:0]      d_sum_i_s;
++  wire    [16:0]      d_sum_q_s;
++  wire                d_sum_sat_i_s;
++  wire                d_sum_sat_q_s;
+   wire                d_sq_enable_s;
+   wire                d_force_mute_s;
+   wire    [15:0]      d_gain_s;
+@@ -236,14 +261,45 @@ module axi_datv_xpdr #(
+         d_out_i <= (d_mute_s == 1'b1) ? 16'd0 : s2_i;
+         d_out_q <= (d_mute_s == 1'b1) ? 16'd0 : s2_q;
+       end
+-      if (s2_sat == 1'b1) begin
++      if (((s2_sat & d_enable_s) | (b_sat_s & d_beacon_s) | d_sum_sat) == 1'b1) begin
+         d_sat_cnt <= d_sat_cnt + 1'b1;
+       end
+     end
+   end
+ 
+-  assign tx_out_data_i = (d_enable_s == 1'b1) ? d_out_i : tx_in_data_i;
+-  assign tx_out_data_q = (d_enable_s == 1'b1) ? d_out_q : tx_in_data_q;
++  // beacon: DMA/interpolator data shifted by the NCO
++
++  datv_nco_mixer i_nco_mixer (
++    .clk (clk),
++    .rst (rst),
++    .enable (d_beacon_s),
++    .phase_inc (d_beacon_freq_s),
++    .in_valid (tx_valid),
++    .in_i (tx_in_data_i),
++    .in_q (tx_in_data_q),
++    .out_valid (b_valid_s),
++    .out_i (b_i_s),
++    .out_q (b_q_s),
++    .out_sat (b_sat_s));
++
++  // repeater + beacon, saturated
++
++  assign d_sum_i_s = ((d_enable_s == 1'b1) ? {d_out_i[15], d_out_i} : 17'd0) +
++                     ((d_beacon_s == 1'b1) ? {b_i_s[15], b_i_s} : 17'd0);
++  assign d_sum_q_s = ((d_enable_s == 1'b1) ? {d_out_q[15], d_out_q} : 17'd0) +
++                     ((d_beacon_s == 1'b1) ? {b_q_s[15], b_q_s} : 17'd0);
++  assign d_sum_sat_i_s = (d_sum_i_s[16] != d_sum_i_s[15]);
++  assign d_sum_sat_q_s = (d_sum_q_s[16] != d_sum_q_s[15]);
++
++  always @(posedge clk) begin
++    d_sum_i <= (d_sum_sat_i_s == 1'b1) ? {d_sum_i_s[16], {15{~d_sum_i_s[16]}}} : d_sum_i_s[15:0];
++    d_sum_q <= (d_sum_sat_q_s == 1'b1) ? {d_sum_q_s[16], {15{~d_sum_q_s[16]}}} : d_sum_q_s[15:0];
++    // count once per output sample
++    d_sum_sat <= tx_valid & (d_sum_sat_i_s | d_sum_sat_q_s);
++  end
++
++  assign tx_out_data_i = ((d_enable_s | d_beacon_s) == 1'b1) ? d_sum_i : tx_in_data_i;
++  assign tx_out_data_q = ((d_enable_s | d_beacon_s) == 1'b1) ? d_sum_q : tx_in_data_q;
+ 
+   // ---------------------------------------------------------------------
+   // processor interface
+@@ -258,16 +314,18 @@ module axi_datv_xpdr #(
+       up_sq_thresh <= 'd0;
+       up_sq_hang <= 32'h00100000;
+       up_avg_shift <= 5'd10;
++      up_beacon_freq <= 'd0;
+     end else begin
+       up_wack <= up_wreq_s;
+       if (up_wreq_s == 1'b1) begin
+         case (up_waddr_s)
+           14'h002: up_scratch <= up_wdata_s;
+-          14'h010: up_control <= up_wdata_s[2:0];
++          14'h010: up_control <= up_wdata_s[3:0];
+           14'h011: up_gain <= up_wdata_s[15:0];
+           14'h012: up_sq_thresh <= up_wdata_s[23:0];
+           14'h013: up_sq_hang <= up_wdata_s;
+           14'h014: up_avg_shift <= (up_wdata_s[4:0] > 5'd24) ? 5'd24 : up_wdata_s[4:0];
++          14'h015: up_beacon_freq <= up_wdata_s;
+           default: ;
+         endcase
+       end
+@@ -286,14 +344,15 @@ module axi_datv_xpdr #(
+           14'h001: up_rdata <= ID;
+           14'h002: up_rdata <= up_scratch;
+           14'h003: up_rdata <= CORE_MAGIC;
+-          14'h010: up_rdata <= {29'd0, up_control};
++          14'h010: up_rdata <= {28'd0, up_control};
+           14'h011: up_rdata <= {16'd0, up_gain};
+           14'h012: up_rdata <= {8'd0, up_sq_thresh};
+           14'h013: up_rdata <= up_sq_hang;
+           14'h014: up_rdata <= {27'd0, up_avg_shift};
+-          14'h020: up_rdata <= {30'd0, up_status_s[1:0]};
+-          14'h021: up_rdata <= {8'd0, up_status_s[25:2]};
+-          14'h022: up_rdata <= up_status_s[57:26];
++          14'h015: up_rdata <= up_beacon_freq;
++          14'h020: up_rdata <= {29'd0, up_status_s[2:0]};
++          14'h021: up_rdata <= {8'd0, up_status_s[26:3]};
++          14'h022: up_rdata <= up_status_s[58:27];
+           default: up_rdata <= 'd0;
+         endcase
+       end else begin
+@@ -305,11 +364,12 @@ module axi_datv_xpdr #(
+   // clock domain crossing
+ 
+   up_xfer_cntrl #(
+-    .DATA_WIDTH (80)
++    .DATA_WIDTH (113)
+   ) i_xfer_cntrl (
+     .up_rstn (up_rstn),
+     .up_clk (up_clk),
+-    .up_data_cntrl ({up_avg_shift,
++    .up_data_cntrl ({up_beacon_freq,
++                     up_avg_shift,
+                      up_sq_hang,
+                      up_sq_thresh,
+                      up_gain,
+@@ -317,16 +377,18 @@ module axi_datv_xpdr #(
+     .up_xfer_done (),
+     .d_rst (rst),
+     .d_clk (clk),
+-    .d_data_cntrl ({d_avg_shift_s,
++    .d_data_cntrl ({d_beacon_freq_s,
++                    d_avg_shift_s,
+                     d_sq_hang_s,
+                     d_sq_thresh_s,
+                     d_gain_s,
++                    d_beacon_s,
+                     d_force_mute_s,
+                     d_sq_enable_s,
+                     d_enable_s}));
+ 
+   up_xfer_status #(
+-    .DATA_WIDTH (58)
++    .DATA_WIDTH (59)
+   ) i_xfer_status (
+     .up_rstn (up_rstn),
+     .up_clk (up_clk),
+@@ -335,6 +397,7 @@ module axi_datv_xpdr #(
+     .d_clk (clk),
+     .d_data_status ({d_sat_cnt,
+                      d_pwr_avg,
++                     d_beacon_s,
+                      d_sq_open,
+                      d_enable_s}));
+ 
+diff --git a/library/axi_datv_xpdr/axi_datv_xpdr_ip.tcl b/library/axi_datv_xpdr/axi_datv_xpdr_ip.tcl
+index 7fcb9907a..c6db1a0db 100644
+--- a/library/axi_datv_xpdr/axi_datv_xpdr_ip.tcl
++++ b/library/axi_datv_xpdr/axi_datv_xpdr_ip.tcl
+@@ -10,6 +10,7 @@ adi_ip_files axi_datv_xpdr [list \
+   "$ad_hdl_dir/library/common/up_xfer_status.v" \
+   "$ad_hdl_dir/library/xilinx/common/up_xfer_cntrl_constr.xdc" \
+   "$ad_hdl_dir/library/xilinx/common/up_xfer_status_constr.xdc" \
++  "datv_nco_mixer.v" \
+   "axi_datv_xpdr.v"]
+ 
+ adi_ip_properties axi_datv_xpdr
+diff --git a/library/axi_datv_xpdr/datv_nco_mixer.v b/library/axi_datv_xpdr/datv_nco_mixer.v
+new file mode 100644
+index 000000000..db6fe8fa5
+--- /dev/null
++++ b/library/axi_datv_xpdr/datv_nco_mixer.v
+@@ -0,0 +1,1206 @@
++// ***************************************************************************
++// ***************************************************************************
++// NCO + complex mixer for the DATV beacon.
++//
++// Multiplies the complex input by exp(j * phase), where the phase advances
++// by phase_inc (full turn = 2^32) for every valid input sample. The sine and
++// cosine are read from a quarter wave table (block RAM) addressed with the
++// 12 MSBs of the phase (spurs < -72 dBc); the mixer uses 4 DSP slices.
++// The phase is held at zero while disabled.
++//
++// The table is generated by the script in the comment at the end of this
++// file.
++// ***************************************************************************
++// ***************************************************************************
++
++`timescale 1ns/100ps
++
++module datv_nco_mixer (
++
++  input                   clk,
++  input                   rst,
++
++  input                   enable,
++  input       [31:0]      phase_inc,
++
++  input                   in_valid,
++  input       [15:0]      in_i,
++  input       [15:0]      in_q,
++
++  output reg              out_valid = 'd0,
++  output reg  [15:0]      out_i = 'd0,
++  output reg  [15:0]      out_q = 'd0,
++  output reg              out_sat = 'd0
++);
++
++  // quarter wave table, sin(pi/2 * (k + 0.5) / 1024) * 32767
++
++  function [14:0] sin_q;
++    input [9:0] k;
++    begin
++      case (k)
++      10'd0: sin_q = 15'd25;
++      10'd1: sin_q = 15'd75;
++      10'd2: sin_q = 15'd126;
++      10'd3: sin_q = 15'd176;
++      10'd4: sin_q = 15'd226;
++      10'd5: sin_q = 15'd276;
++      10'd6: sin_q = 15'd327;
++      10'd7: sin_q = 15'd377;
++      10'd8: sin_q = 15'd427;
++      10'd9: sin_q = 15'd477;
++      10'd10: sin_q = 15'd528;
++      10'd11: sin_q = 15'd578;
++      10'd12: sin_q = 15'd628;
++      10'd13: sin_q = 15'd679;
++      10'd14: sin_q = 15'd729;
++      10'd15: sin_q = 15'd779;
++      10'd16: sin_q = 15'd829;
++      10'd17: sin_q = 15'd880;
++      10'd18: sin_q = 15'd930;
++      10'd19: sin_q = 15'd980;
++      10'd20: sin_q = 15'd1030;
++      10'd21: sin_q = 15'd1080;
++      10'd22: sin_q = 15'd1131;
++      10'd23: sin_q = 15'd1181;
++      10'd24: sin_q = 15'd1231;
++      10'd25: sin_q = 15'd1281;
++      10'd26: sin_q = 15'd1332;
++      10'd27: sin_q = 15'd1382;
++      10'd28: sin_q = 15'd1432;
++      10'd29: sin_q = 15'd1482;
++      10'd30: sin_q = 15'd1532;
++      10'd31: sin_q = 15'd1583;
++      10'd32: sin_q = 15'd1633;
++      10'd33: sin_q = 15'd1683;
++      10'd34: sin_q = 15'd1733;
++      10'd35: sin_q = 15'd1783;
++      10'd36: sin_q = 15'd1834;
++      10'd37: sin_q = 15'd1884;
++      10'd38: sin_q = 15'd1934;
++      10'd39: sin_q = 15'd1984;
++      10'd40: sin_q = 15'd2034;
++      10'd41: sin_q = 15'd2085;
++      10'd42: sin_q = 15'd2135;
++      10'd43: sin_q = 15'd2185;
++      10'd44: sin_q = 15'd2235;
++      10'd45: sin_q = 15'd2285;
++      10'd46: sin_q = 15'd2335;
++      10'd47: sin_q = 15'd2385;
++      10'd48: sin_q = 15'd2436;
++      10'd49: sin_q = 15'd2486;
++      10'd50: sin_q = 15'd2536;
++      10'd51: sin_q = 15'd2586;
++      10'd52: sin_q = 15'd2636;
++      10'd53: sin_q = 15'd2686;
++      10'd54: sin_q = 15'd2736;
++      10'd55: sin_q = 15'd2786;
++      10'd56: sin_q = 15'd2836;
++      10'd57: sin_q = 15'd2886;
++      10'd58: sin_q = 15'd2936;
++      10'd59: sin_q = 15'd2987;
++      10'd60: sin_q = 15'd3037;
++      10'd61: sin_q = 15'd3087;
++      10'd62: sin_q = 15'd3137;
++      10'd63: sin_q = 15'd3187;
++      10'd64: sin_q = 15'd3237;
++      10'd65: sin_q = 15'd3287;
++      10'd66: sin_q = 15'd3337;
++      10'd67: sin_q = 15'd3387;
++      10'd68: sin_q = 15'd3437;
++      10'd69: sin_q = 15'd3487;
++      10'd70: sin_q = 15'd3537;
++      10'd71: sin_q = 15'd3587;
++      10'd72: sin_q = 15'd3637;
++      10'd73: sin_q = 15'd3687;
++      10'd74: sin_q = 15'd3737;
++      10'd75: sin_q = 15'd3786;
++      10'd76: sin_q = 15'd3836;
++      10'd77: sin_q = 15'd3886;
++      10'd78: sin_q = 15'd3936;
++      10'd79: sin_q = 15'd3986;
++      10'd80: sin_q = 15'd4036;
++      10'd81: sin_q = 15'd4086;
++      10'd82: sin_q = 15'd4136;
++      10'd83: sin_q = 15'd4186;
++      10'd84: sin_q = 15'd4235;
++      10'd85: sin_q = 15'd4285;
++      10'd86: sin_q = 15'd4335;
++      10'd87: sin_q = 15'd4385;
++      10'd88: sin_q = 15'd4435;
++      10'd89: sin_q = 15'd4485;
++      10'd90: sin_q = 15'd4534;
++      10'd91: sin_q = 15'd4584;
++      10'd92: sin_q = 15'd4634;
++      10'd93: sin_q = 15'd4684;
++      10'd94: sin_q = 15'd4733;
++      10'd95: sin_q = 15'd4783;
++      10'd96: sin_q = 15'd4833;
++      10'd97: sin_q = 15'd4882;
++      10'd98: sin_q = 15'd4932;
++      10'd99: sin_q = 15'd4982;
++      10'd100: sin_q = 15'd5032;
++      10'd101: sin_q = 15'd5081;
++      10'd102: sin_q = 15'd5131;
++      10'd103: sin_q = 15'd5180;
++      10'd104: sin_q = 15'd5230;
++      10'd105: sin_q = 15'd5280;
++      10'd106: sin_q = 15'd5329;
++      10'd107: sin_q = 15'd5379;
++      10'd108: sin_q = 15'd5428;
++      10'd109: sin_q = 15'd5478;
++      10'd110: sin_q = 15'd5528;
++      10'd111: sin_q = 15'd5577;
++      10'd112: sin_q = 15'd5627;
++      10'd113: sin_q = 15'd5676;
++      10'd114: sin_q = 15'd5726;
++      10'd115: sin_q = 15'd5775;
++      10'd116: sin_q = 15'd5825;
++      10'd117: sin_q = 15'd5874;
++      10'd118: sin_q = 15'd5924;
++      10'd119: sin_q = 15'd5973;
++      10'd120: sin_q = 15'd6022;
++      10'd121: sin_q = 15'd6072;
++      10'd122: sin_q = 15'd6121;
++      10'd123: sin_q = 15'd6171;
++      10'd124: sin_q = 15'd6220;
++      10'd125: sin_q = 15'd6269;
++      10'd126: sin_q = 15'd6319;
++      10'd127: sin_q = 15'd6368;
++      10'd128: sin_q = 15'd6417;
++      10'd129: sin_q = 15'd6466;
++      10'd130: sin_q = 15'd6516;
++      10'd131: sin_q = 15'd6565;
++      10'd132: sin_q = 15'd6614;
++      10'd133: sin_q = 15'd6663;
++      10'd134: sin_q = 15'd6713;
++      10'd135: sin_q = 15'd6762;
++      10'd136: sin_q = 15'd6811;
++      10'd137: sin_q = 15'd6860;
++      10'd138: sin_q = 15'd6909;
++      10'd139: sin_q = 15'd6958;
++      10'd140: sin_q = 15'd7008;
++      10'd141: sin_q = 15'd7057;
++      10'd142: sin_q = 15'd7106;
++      10'd143: sin_q = 15'd7155;
++      10'd144: sin_q = 15'd7204;
++      10'd145: sin_q = 15'd7253;
++      10'd146: sin_q = 15'd7302;
++      10'd147: sin_q = 15'd7351;
++      10'd148: sin_q = 15'd7400;
++      10'd149: sin_q = 15'd7449;
++      10'd150: sin_q = 15'd7498;
++      10'd151: sin_q = 15'd7547;
++      10'd152: sin_q = 15'd7596;
++      10'd153: sin_q = 15'd7644;
++      10'd154: sin_q = 15'd7693;
++      10'd155: sin_q = 15'd7742;
++      10'd156: sin_q = 15'd7791;
++      10'd157: sin_q = 15'd7840;
++      10'd158: sin_q = 15'd7889;
++      10'd159: sin_q = 15'd7937;
++      10'd160: sin_q = 15'd7986;
++      10'd161: sin_q = 15'd8035;
++      10'd162: sin_q = 15'd8084;
++      10'd163: sin_q = 15'd8132;
++      10'd164: sin_q = 15'd8181;
++      10'd165: sin_q = 15'd8230;
++      10'd166: sin_q = 15'd8278;
++      10'd167: sin_q = 15'd8327;
++      10'd168: sin_q = 15'd8375;
++      10'd169: sin_q = 15'd8424;
++      10'd170: sin_q = 15'd8473;
++      10'd171: sin_q = 15'd8521;
++      10'd172: sin_q = 15'd8570;
++      10'd173: sin_q = 15'd8618;
++      10'd174: sin_q = 15'd8667;
++      10'd175: sin_q = 15'd8715;
++      10'd176: sin_q = 15'd8764;
++      10'd177: sin_q = 15'd8812;
++      10'd178: sin_q = 15'd8860;
++      10'd179: sin_q = 15'd8909;
++      10'd180: sin_q = 15'd8957;
++      10'd181: sin_q = 15'd9006;
++      10'd182: sin_q = 15'd9054;
++      10'd183: sin_q = 15'd9102;
++      10'd184: sin_q = 15'd9150;
++      10'd185: sin_q = 15'd9199;
++      10'd186: sin_q = 15'd9247;
++      10'd187: sin_q = 15'd9295;
++      10'd188: sin_q = 15'd9343;
++      10'd189: sin_q = 15'd9391;
++      10'd190: sin_q = 15'd9440;
++      10'd191: sin_q = 15'd9488;
++      10'd192: sin_q = 15'd9536;
++      10'd193: sin_q = 15'd9584;
++      10'd194: sin_q = 15'd9632;
++      10'd195: sin_q = 15'd9680;
++      10'd196: sin_q = 15'd9728;
++      10'd197: sin_q = 15'd9776;
++      10'd198: sin_q = 15'd9824;
++      10'd199: sin_q = 15'd9872;
++      10'd200: sin_q = 15'd9920;
++      10'd201: sin_q = 15'd9968;
++      10'd202: sin_q = 15'd10016;
++      10'd203: sin_q = 15'd10063;
++      10'd204: sin_q = 15'd10111;
++      10'd205: sin_q = 15'd10159;
++      10'd206: sin_q = 15'd10207;
++      10'd207: sin_q = 15'd10255;
++      10'd208: sin_q = 15'd10302;
++      10'd209: sin_q = 15'd10350;
++      10'd210: sin_q = 15'd10398;
++      10'd211: sin_q = 15'd10445;
++      10'd212: sin_q = 15'd10493;
++      10'd213: sin_q = 15'd10541;
++      10'd214: sin_q = 15'd10588;
++      10'd215: sin_q = 15'd10636;
++      10'd216: sin_q = 15'd10683;
++      10'd217: sin_q = 15'd10731;
++      10'd218: sin_q = 15'd10778;
++      10'd219: sin_q = 15'd10826;
++      10'd220: sin_q = 15'd10873;
++      10'd221: sin_q = 15'd10920;
++      10'd222: sin_q = 15'd10968;
++      10'd223: sin_q = 15'd11015;
++      10'd224: sin_q = 15'd11063;
++      10'd225: sin_q = 15'd11110;
++      10'd226: sin_q = 15'd11157;
++      10'd227: sin_q = 15'd11204;
++      10'd228: sin_q = 15'd11252;
++      10'd229: sin_q = 15'd11299;
++      10'd230: sin_q = 15'd11346;
++      10'd231: sin_q = 15'd11393;
++      10'd232: sin_q = 15'd11440;
++      10'd233: sin_q = 15'd11487;
++      10'd234: sin_q = 15'd11534;
++      10'd235: sin_q = 15'd11581;
++      10'd236: sin_q = 15'd11628;
++      10'd237: sin_q = 15'd11675;
++      10'd238: sin_q = 15'd11722;
++      10'd239: sin_q = 15'd11769;
++      10'd240: sin_q = 15'd11816;
++      10'd241: sin_q = 15'd11863;
++      10'd242: sin_q = 15'd11910;
++      10'd243: sin_q = 15'd11957;
++      10'd244: sin_q = 15'd12003;
++      10'd245: sin_q = 15'd12050;
++      10'd246: sin_q = 15'd12097;
++      10'd247: sin_q = 15'd12144;
++      10'd248: sin_q = 15'd12190;
++      10'd249: sin_q = 15'd12237;
++      10'd250: sin_q = 15'd12284;
++      10'd251: sin_q = 15'd12330;
++      10'd252: sin_q = 15'd12377;
++      10'd253: sin_q = 15'd12423;
++      10'd254: sin_q = 15'd12470;
++      10'd255: sin_q = 15'd12516;
++      10'd256: sin_q = 15'd12563;
++      10'd257: sin_q = 15'd12609;
++      10'd258: sin_q = 15'd12655;
++      10'd259: sin_q = 15'd12702;
++      10'd260: sin_q = 15'd12748;
++      10'd261: sin_q = 15'd12794;
++      10'd262: sin_q = 15'd12841;
++      10'd263: sin_q = 15'd12887;
++      10'd264: sin_q = 15'd12933;
++      10'd265: sin_q = 15'd12979;
++      10'd266: sin_q = 15'd13025;
++      10'd267: sin_q = 15'd13071;
++      10'd268: sin_q = 15'd13118;
++      10'd269: sin_q = 15'd13164;
++      10'd270: sin_q = 15'd13210;
++      10'd271: sin_q = 15'd13256;
++      10'd272: sin_q = 15'd13302;
++      10'd273: sin_q = 15'd13347;
++      10'd274: sin_q = 15'd13393;
++      10'd275: sin_q = 15'd13439;
++      10'd276: sin_q = 15'd13485;
++      10'd277: sin_q = 15'd13531;
++      10'd278: sin_q = 15'd13577;
++      10'd279: sin_q = 15'd13622;
++      10'd280: sin_q = 15'd13668;
++      10'd281: sin_q = 15'd13714;
++      10'd282: sin_q = 15'd13759;
++      10'd283: sin_q = 15'd13805;
++      10'd284: sin_q = 15'd13850;
++      10'd285: sin_q = 15'd13896;
++      10'd286: sin_q = 15'd13942;
++      10'd287: sin_q = 15'd13987;
++      10'd288: sin_q = 15'd14032;
++      10'd289: sin_q = 15'd14078;
++      10'd290: sin_q = 15'd14123;
++      10'd291: sin_q = 15'd14169;
++      10'd292: sin_q = 15'd14214;
++      10'd293: sin_q = 15'd14259;
++      10'd294: sin_q = 15'd14304;
++      10'd295: sin_q = 15'd14350;
++      10'd296: sin_q = 15'd14395;
++      10'd297: sin_q = 15'd14440;
++      10'd298: sin_q = 15'd14485;
++      10'd299: sin_q = 15'd14530;
++      10'd300: sin_q = 15'd14575;
++      10'd301: sin_q = 15'd14620;
++      10'd302: sin_q = 15'd14665;
++      10'd303: sin_q = 15'd14710;
++      10'd304: sin_q = 15'd14755;
++      10'd305: sin_q = 15'd14800;
++      10'd306: sin_q = 15'd14845;
++      10'd307: sin_q = 15'd14889;
++      10'd308: sin_q = 15'd14934;
++      10'd309: sin_q = 15'd14979;
++      10'd310: sin_q = 15'd15024;
++      10'd311: sin_q = 15'd15068;
++      10'd312: sin_q = 15'd15113;
++      10'd313: sin_q = 15'd15157;
++      10'd314: sin_q = 15'd15202;
++      10'd315: sin_q = 15'd15246;
++      10'd316: sin_q = 15'd15291;
++      10'd317: sin_q = 15'd15335;
++      10'd318: sin_q = 15'd15380;
++      10'd319: sin_q = 15'd15424;
++      10'd320: sin_q = 15'd15468;
++      10'd321: sin_q = 15'd15513;
++      10'd322: sin_q = 15'd15557;
++      10'd323: sin_q = 15'd15601;
++      10'd324: sin_q = 15'd15645;
++      10'd325: sin_q = 15'd15690;
++      10'd326: sin_q = 15'd15734;
++      10'd327: sin_q = 15'd15778;
++      10'd328: sin_q = 15'd15822;
++      10'd329: sin_q = 15'd15866;
++      10'd330: sin_q = 15'd15910;
++      10'd331: sin_q = 15'd15954;
++      10'd332: sin_q = 15'd15997;
++      10'd333: sin_q = 15'd16041;
++      10'd334: sin_q = 15'd16085;
++      10'd335: sin_q = 15'd16129;
++      10'd336: sin_q = 15'd16173;
++      10'd337: sin_q = 15'd16216;
++      10'd338: sin_q = 15'd16260;
++      10'd339: sin_q = 15'd16304;
++      10'd340: sin_q = 15'd16347;
++      10'd341: sin_q = 15'd16391;
++      10'd342: sin_q = 15'd16434;
++      10'd343: sin_q = 15'd16478;
++      10'd344: sin_q = 15'd16521;
++      10'd345: sin_q = 15'd16565;
++      10'd346: sin_q = 15'd16608;
++      10'd347: sin_q = 15'd16651;
++      10'd348: sin_q = 15'd16694;
++      10'd349: sin_q = 15'd16738;
++      10'd350: sin_q = 15'd16781;
++      10'd351: sin_q = 15'd16824;
++      10'd352: sin_q = 15'd16867;
++      10'd353: sin_q = 15'd16910;
++      10'd354: sin_q = 15'd16953;
++      10'd355: sin_q = 15'd16996;
++      10'd356: sin_q = 15'd17039;
++      10'd357: sin_q = 15'd17082;
++      10'd358: sin_q = 15'd17125;
++      10'd359: sin_q = 15'd17168;
++      10'd360: sin_q = 15'd17211;
++      10'd361: sin_q = 15'd17253;
++      10'd362: sin_q = 15'd17296;
++      10'd363: sin_q = 15'd17339;
++      10'd364: sin_q = 15'd17381;
++      10'd365: sin_q = 15'd17424;
++      10'd366: sin_q = 15'd17467;
++      10'd367: sin_q = 15'd17509;
++      10'd368: sin_q = 15'd17551;
++      10'd369: sin_q = 15'd17594;
++      10'd370: sin_q = 15'd17636;
++      10'd371: sin_q = 15'd17679;
++      10'd372: sin_q = 15'd17721;
++      10'd373: sin_q = 15'd17763;
++      10'd374: sin_q = 15'd17805;
++      10'd375: sin_q = 15'd17848;
++      10'd376: sin_q = 15'd17890;
++      10'd377: sin_q = 15'd17932;
++      10'd378: sin_q = 15'd17974;
++      10'd379: sin_q = 15'd18016;
++      10'd380: sin_q = 15'd18058;
++      10'd381: sin_q = 15'd18100;
++      10'd382: sin_q = 15'd18142;
++      10'd383: sin_q = 15'd18183;
++      10'd384: sin_q = 15'd18225;
++      10'd385: sin_q = 15'd18267;
++      10'd386: sin_q = 15'd18309;
++      10'd387: sin_q = 15'd18350;
++      10'd388: sin_q = 15'd18392;
++      10'd389: sin_q = 15'd18434;
++      10'd390: sin_q = 15'd18475;
++      10'd391: sin_q = 15'd18517;
++      10'd392: sin_q = 15'd18558;
++      10'd393: sin_q = 15'd18599;
++      10'd394: sin_q = 15'd18641;
++      10'd395: sin_q = 15'd18682;
++      10'd396: sin_q = 15'd18723;
++      10'd397: sin_q = 15'd18765;
++      10'd398: sin_q = 15'd18806;
++      10'd399: sin_q = 15'd18847;
++      10'd400: sin_q = 15'd18888;
++      10'd401: sin_q = 15'd18929;
++      10'd402: sin_q = 15'd18970;
++      10'd403: sin_q = 15'd19011;
++      10'd404: sin_q = 15'd19052;
++      10'd405: sin_q = 15'd19093;
++      10'd406: sin_q = 15'd19134;
++      10'd407: sin_q = 15'd19174;
++      10'd408: sin_q = 15'd19215;
++      10'd409: sin_q = 15'd19256;
++      10'd410: sin_q = 15'd19297;
++      10'd411: sin_q = 15'd19337;
++      10'd412: sin_q = 15'd19378;
++      10'd413: sin_q = 15'd19418;
++      10'd414: sin_q = 15'd19459;
++      10'd415: sin_q = 15'd19499;
++      10'd416: sin_q = 15'd19539;
++      10'd417: sin_q = 15'd19580;
++      10'd418: sin_q = 15'd19620;
++      10'd419: sin_q = 15'd19660;
++      10'd420: sin_q = 15'd19700;
++      10'd421: sin_q = 15'd19741;
++      10'd422: sin_q = 15'd19781;
++      10'd423: sin_q = 15'd19821;
++      10'd424: sin_q = 15'd19861;
++      10'd425: sin_q = 15'd19901;
++      10'd426: sin_q = 15'd19941;
++      10'd427: sin_q = 15'd19981;
++      10'd428: sin_q = 15'd20020;
++      10'd429: sin_q = 15'd20060;
++      10'd430: sin_q = 15'd20100;
++      10'd431: sin_q = 15'd20139;
++      10'd432: sin_q = 15'd20179;
++      10'd433: sin_q = 15'd20219;
++      10'd434: sin_q = 15'd20258;
++      10'd435: sin_q = 15'd20298;
++      10'd436: sin_q = 15'd20337;
++      10'd437: sin_q = 15'd20377;
++      10'd438: sin_q = 15'd20416;
++      10'd439: sin_q = 15'd20455;
++      10'd440: sin_q = 15'd20494;
++      10'd441: sin_q = 15'd20534;
++      10'd442: sin_q = 15'd20573;
++      10'd443: sin_q = 15'd20612;
++      10'd444: sin_q = 15'd20651;
++      10'd445: sin_q = 15'd20690;
++      10'd446: sin_q = 15'd20729;
++      10'd447: sin_q = 15'd20768;
++      10'd448: sin_q = 15'd20807;
++      10'd449: sin_q = 15'd20845;
++      10'd450: sin_q = 15'd20884;
++      10'd451: sin_q = 15'd20923;
++      10'd452: sin_q = 15'd20962;
++      10'd453: sin_q = 15'd21000;
++      10'd454: sin_q = 15'd21039;
++      10'd455: sin_q = 15'd21077;
++      10'd456: sin_q = 15'd21116;
++      10'd457: sin_q = 15'd21154;
++      10'd458: sin_q = 15'd21192;
++      10'd459: sin_q = 15'd21231;
++      10'd460: sin_q = 15'd21269;
++      10'd461: sin_q = 15'd21307;
++      10'd462: sin_q = 15'd21345;
++      10'd463: sin_q = 15'd21383;
++      10'd464: sin_q = 15'd21422;
++      10'd465: sin_q = 15'd21460;
++      10'd466: sin_q = 15'd21498;
++      10'd467: sin_q = 15'd21535;
++      10'd468: sin_q = 15'd21573;
++      10'd469: sin_q = 15'd21611;
++      10'd470: sin_q = 15'd21649;
++      10'd471: sin_q = 15'd21687;
++      10'd472: sin_q = 15'd21724;
++      10'd473: sin_q = 15'd21762;
++      10'd474: sin_q = 15'd21799;
++      10'd475: sin_q = 15'd21837;
++      10'd476: sin_q = 15'd21874;
++      10'd477: sin_q = 15'd21912;
++      10'd478: sin_q = 15'd21949;
++      10'd479: sin_q = 15'd21986;
++      10'd480: sin_q = 15'd22024;
++      10'd481: sin_q = 15'd22061;
++      10'd482: sin_q = 15'd22098;
++      10'd483: sin_q = 15'd22135;
++      10'd484: sin_q = 15'd22172;
++      10'd485: sin_q = 15'd22209;
++      10'd486: sin_q = 15'd22246;
++      10'd487: sin_q = 15'd22283;
++      10'd488: sin_q = 15'd22320;
++      10'd489: sin_q = 15'd22356;
++      10'd490: sin_q = 15'd22393;
++      10'd491: sin_q = 15'd22430;
++      10'd492: sin_q = 15'd22466;
++      10'd493: sin_q = 15'd22503;
++      10'd494: sin_q = 15'd22540;
++      10'd495: sin_q = 15'd22576;
++      10'd496: sin_q = 15'd22612;
++      10'd497: sin_q = 15'd22649;
++      10'd498: sin_q = 15'd22685;
++      10'd499: sin_q = 15'd22721;
++      10'd500: sin_q = 15'd22757;
++      10'd501: sin_q = 15'd22794;
++      10'd502: sin_q = 15'd22830;
++      10'd503: sin_q = 15'd22866;
++      10'd504: sin_q = 15'd22902;
++      10'd505: sin_q = 15'd22938;
++      10'd506: sin_q = 15'd22973;
++      10'd507: sin_q = 15'd23009;
++      10'd508: sin_q = 15'd23045;
++      10'd509: sin_q = 15'd23081;
++      10'd510: sin_q = 15'd23116;
++      10'd511: sin_q = 15'd23152;
++      10'd512: sin_q = 15'd23188;
++      10'd513: sin_q = 15'd23223;
++      10'd514: sin_q = 15'd23258;
++      10'd515: sin_q = 15'd23294;
++      10'd516: sin_q = 15'd23329;
++      10'd517: sin_q = 15'd23364;
++      10'd518: sin_q = 15'd23400;
++      10'd519: sin_q = 15'd23435;
++      10'd520: sin_q = 15'd23470;
++      10'd521: sin_q = 15'd23505;
++      10'd522: sin_q = 15'd23540;
++      10'd523: sin_q = 15'd23575;
++      10'd524: sin_q = 15'd23610;
++      10'd525: sin_q = 15'd23645;
++      10'd526: sin_q = 15'd23679;
++      10'd527: sin_q = 15'd23714;
++      10'd528: sin_q = 15'd23749;
++      10'd529: sin_q = 15'd23783;
++      10'd530: sin_q = 15'd23818;
++      10'd531: sin_q = 15'd23852;
++      10'd532: sin_q = 15'd23887;
++      10'd533: sin_q = 15'd23921;
++      10'd534: sin_q = 15'd23956;
++      10'd535: sin_q = 15'd23990;
++      10'd536: sin_q = 15'd24024;
++      10'd537: sin_q = 15'd24058;
++      10'd538: sin_q = 15'd24092;
++      10'd539: sin_q = 15'd24126;
++      10'd540: sin_q = 15'd24160;
++      10'd541: sin_q = 15'd24194;
++      10'd542: sin_q = 15'd24228;
++      10'd543: sin_q = 15'd24262;
++      10'd544: sin_q = 15'd24296;
++      10'd545: sin_q = 15'd24329;
++      10'd546: sin_q = 15'd24363;
++      10'd547: sin_q = 15'd24397;
++      10'd548: sin_q = 15'd24430;
++      10'd549: sin_q = 15'd24464;
++      10'd550: sin_q = 15'd24497;
++      10'd551: sin_q = 15'd24530;
++      10'd552: sin_q = 15'd24564;
++      10'd553: sin_q = 15'd24597;
++      10'd554: sin_q = 15'd24630;
++      10'd555: sin_q = 15'd24663;
++      10'd556: sin_q = 15'd24696;
++      10'd557: sin_q = 15'd24729;
++      10'd558: sin_q = 15'd24762;
++      10'd559: sin_q = 15'd24795;
++      10'd560: sin_q = 15'd24828;
++      10'd561: sin_q = 15'd24861;
++      10'd562: sin_q = 15'd24893;
++      10'd563: sin_q = 15'd24926;
++      10'd564: sin_q = 15'd24959;
++      10'd565: sin_q = 15'd24991;
++      10'd566: sin_q = 15'd25024;
++      10'd567: sin_q = 15'd25056;
++      10'd568: sin_q = 15'd25088;
++      10'd569: sin_q = 15'd25121;
++      10'd570: sin_q = 15'd25153;
++      10'd571: sin_q = 15'd25185;
++      10'd572: sin_q = 15'd25217;
++      10'd573: sin_q = 15'd25249;
++      10'd574: sin_q = 15'd25281;
++      10'd575: sin_q = 15'd25313;
++      10'd576: sin_q = 15'd25345;
++      10'd577: sin_q = 15'd25377;
++      10'd578: sin_q = 15'd25409;
++      10'd579: sin_q = 15'd25440;
++      10'd580: sin_q = 15'd25472;
++      10'd581: sin_q = 15'd25504;
++      10'd582: sin_q = 15'd25535;
++      10'd583: sin_q = 15'd25567;
++      10'd584: sin_q = 15'd25598;
++      10'd585: sin_q = 15'd25629;
++      10'd586: sin_q = 15'd25661;
++      10'd587: sin_q = 15'd25692;
++      10'd588: sin_q = 15'd25723;
++      10'd589: sin_q = 15'd25754;
++      10'd590: sin_q = 15'd25785;
++      10'd591: sin_q = 15'd25816;
++      10'd592: sin_q = 15'd25847;
++      10'd593: sin_q = 15'd25878;
++      10'd594: sin_q = 15'd25909;
++      10'd595: sin_q = 15'd25940;
++      10'd596: sin_q = 15'd25970;
++      10'd597: sin_q = 15'd26001;
++      10'd598: sin_q = 15'd26031;
++      10'd599: sin_q = 15'd26062;
++      10'd600: sin_q = 15'd26092;
++      10'd601: sin_q = 15'd26123;
++      10'd602: sin_q = 15'd26153;
++      10'd603: sin_q = 15'd26183;
++      10'd604: sin_q = 15'd26214;
++      10'd605: sin_q = 15'd26244;
++      10'd606: sin_q = 15'd26274;
++      10'd607: sin_q = 15'd26304;
++      10'd608: sin_q = 15'd26334;
++      10'd609: sin_q = 15'd26364;
++      10'd610: sin_q = 15'd26393;
++      10'd611: sin_q = 15'd26423;
++      10'd612: sin_q = 15'd26453;
++      10'd613: sin_q = 15'd26482;
++      10'd614: sin_q = 15'd26512;
++      10'd615: sin_q = 15'd26542;
++      10'd616: sin_q = 15'd26571;
++      10'd617: sin_q = 15'd26600;
++      10'd618: sin_q = 15'd26630;
++      10'd619: sin_q = 15'd26659;
++      10'd620: sin_q = 15'd26688;
++      10'd621: sin_q = 15'd26717;
++      10'd622: sin_q = 15'd26746;
++      10'd623: sin_q = 15'd26775;
++      10'd624: sin_q = 15'd26804;
++      10'd625: sin_q = 15'd26833;
++      10'd626: sin_q = 15'd26862;
++      10'd627: sin_q = 15'd26891;
++      10'd628: sin_q = 15'd26919;
++      10'd629: sin_q = 15'd26948;
++      10'd630: sin_q = 15'd26977;
++      10'd631: sin_q = 15'd27005;
++      10'd632: sin_q = 15'd27034;
++      10'd633: sin_q = 15'd27062;
++      10'd634: sin_q = 15'd27090;
++      10'd635: sin_q = 15'd27118;
++      10'd636: sin_q = 15'd27147;
++      10'd637: sin_q = 15'd27175;
++      10'd638: sin_q = 15'd27203;
++      10'd639: sin_q = 15'd27231;
++      10'd640: sin_q = 15'd27259;
++      10'd641: sin_q = 15'd27287;
++      10'd642: sin_q = 15'd27314;
++      10'd643: sin_q = 15'd27342;
++      10'd644: sin_q = 15'd27370;
++      10'd645: sin_q = 15'd27397;
++      10'd646: sin_q = 15'd27425;
++      10'd647: sin_q = 15'd27452;
++      10'd648: sin_q = 15'd27480;
++      10'd649: sin_q = 15'd27507;
++      10'd650: sin_q = 15'd27534;
++      10'd651: sin_q = 15'd27562;
++      10'd652: sin_q = 15'd27589;
++      10'd653: sin_q = 15'd27616;
++      10'd654: sin_q = 15'd27643;
++      10'd655: sin_q = 15'd27670;
++      10'd656: sin_q = 15'd27697;
++      10'd657: sin_q = 15'd27724;
++      10'd658: sin_q = 15'd27750;
++      10'd659: sin_q = 15'd27777;
++      10'd660: sin_q = 15'd27804;
++      10'd661: sin_q = 15'd27830;
++      10'd662: sin_q = 15'd27857;
++      10'd663: sin_q = 15'd27883;
++      10'd664: sin_q = 15'd27910;
++      10'd665: sin_q = 15'd27936;
++      10'd666: sin_q = 15'd27962;
++      10'd667: sin_q = 15'd27988;
++      10'd668: sin_q = 15'd28014;
++      10'd669: sin_q = 15'd28040;
++      10'd670: sin_q = 15'd28066;
++      10'd671: sin_q = 15'd28092;
++      10'd672: sin_q = 15'd28118;
++      10'd673: sin_q = 15'd28144;
++      10'd674: sin_q = 15'd28170;
++      10'd675: sin_q = 15'd28195;
++      10'd676: sin_q = 15'd28221;
++      10'd677: sin_q = 15'd28246;
++      10'd678: sin_q = 15'd28272;
++      10'd679: sin_q = 15'd28297;
++      10'd680: sin_q = 15'd28322;
++      10'd681: sin_q = 15'd28348;
++      10'd682: sin_q = 15'd28373;
++      10'd683: sin_q = 15'd28398;
++      10'd684: sin_q = 15'd28423;
++      10'd685: sin_q = 15'd28448;
++      10'd686: sin_q = 15'd28473;
++      10'd687: sin_q = 15'd28498;
++      10'd688: sin_q = 15'd28523;
++      10'd689: sin_q = 15'd28547;
++      10'd690: sin_q = 15'd28572;
++      10'd691: sin_q = 15'd28596;
++      10'd692: sin_q = 15'd28621;
++      10'd693: sin_q = 15'd28645;
++      10'd694: sin_q = 15'd28670;
++      10'd695: sin_q = 15'd28694;
++      10'd696: sin_q = 15'd28718;
++      10'd697: sin_q = 15'd28742;
++      10'd698: sin_q = 15'd28767;
++      10'd699: sin_q = 15'd28791;
++      10'd700: sin_q = 15'd28815;
++      10'd701: sin_q = 15'd28838;
++      10'd702: sin_q = 15'd28862;
++      10'd703: sin_q = 15'd28886;
++      10'd704: sin_q = 15'd28910;
++      10'd705: sin_q = 15'd28933;
++      10'd706: sin_q = 15'd28957;
++      10'd707: sin_q = 15'd28980;
++      10'd708: sin_q = 15'd29004;
++      10'd709: sin_q = 15'd29027;
++      10'd710: sin_q = 15'd29050;
++      10'd711: sin_q = 15'd29074;
++      10'd712: sin_q = 15'd29097;
++      10'd713: sin_q = 15'd29120;
++      10'd714: sin_q = 15'd29143;
++      10'd715: sin_q = 15'd29166;
++      10'd716: sin_q = 15'd29189;
++      10'd717: sin_q = 15'd29212;
++      10'd718: sin_q = 15'd29234;
++      10'd719: sin_q = 15'd29257;
++      10'd720: sin_q = 15'd29280;
++      10'd721: sin_q = 15'd29302;
++      10'd722: sin_q = 15'd29325;
++      10'd723: sin_q = 15'd29347;
++      10'd724: sin_q = 15'd29369;
++      10'd725: sin_q = 15'd29392;
++      10'd726: sin_q = 15'd29414;
++      10'd727: sin_q = 15'd29436;
++      10'd728: sin_q = 15'd29458;
++      10'd729: sin_q = 15'd29480;
++      10'd730: sin_q = 15'd29502;
++      10'd731: sin_q = 15'd29524;
++      10'd732: sin_q = 15'd29545;
++      10'd733: sin_q = 15'd29567;
++      10'd734: sin_q = 15'd29589;
++      10'd735: sin_q = 15'd29610;
++      10'd736: sin_q = 15'd29632;
++      10'd737: sin_q = 15'd29653;
++      10'd738: sin_q = 15'd29675;
++      10'd739: sin_q = 15'd29696;
++      10'd740: sin_q = 15'd29717;
++      10'd741: sin_q = 15'd29738;
++      10'd742: sin_q = 15'd29759;
++      10'd743: sin_q = 15'd29780;
++      10'd744: sin_q = 15'd29801;
++      10'd745: sin_q = 15'd29822;
++      10'd746: sin_q = 15'd29843;
++      10'd747: sin_q = 15'd29864;
++      10'd748: sin_q = 15'd29884;
++      10'd749: sin_q = 15'd29905;
++      10'd750: sin_q = 15'd29925;
++      10'd751: sin_q = 15'd29946;
++      10'd752: sin_q = 15'd29966;
++      10'd753: sin_q = 15'd29986;
++      10'd754: sin_q = 15'd30007;
++      10'd755: sin_q = 15'd30027;
++      10'd756: sin_q = 15'd30047;
++      10'd757: sin_q = 15'd30067;
++      10'd758: sin_q = 15'd30087;
++      10'd759: sin_q = 15'd30107;
++      10'd760: sin_q = 15'd30126;
++      10'd761: sin_q = 15'd30146;
++      10'd762: sin_q = 15'd30166;
++      10'd763: sin_q = 15'd30185;
++      10'd764: sin_q = 15'd30205;
++      10'd765: sin_q = 15'd30224;
++      10'd766: sin_q = 15'd30244;
++      10'd767: sin_q = 15'd30263;
++      10'd768: sin_q = 15'd30282;
++      10'd769: sin_q = 15'd30302;
++      10'd770: sin_q = 15'd30321;
++      10'd771: sin_q = 15'd30340;
++      10'd772: sin_q = 15'd30359;
++      10'd773: sin_q = 15'd30377;
++      10'd774: sin_q = 15'd30396;
++      10'd775: sin_q = 15'd30415;
++      10'd776: sin_q = 15'd30434;
++      10'd777: sin_q = 15'd30452;
++      10'd778: sin_q = 15'd30471;
++      10'd779: sin_q = 15'd30489;
++      10'd780: sin_q = 15'd30508;
++      10'd781: sin_q = 15'd30526;
++      10'd782: sin_q = 15'd30544;
++      10'd783: sin_q = 15'd30562;
++      10'd784: sin_q = 15'd30580;
++      10'd785: sin_q = 15'd30598;
++      10'd786: sin_q = 15'd30616;
++      10'd787: sin_q = 15'd30634;
++      10'd788: sin_q = 15'd30652;
++      10'd789: sin_q = 15'd30670;
++      10'd790: sin_q = 15'd30687;
++      10'd791: sin_q = 15'd30705;
++      10'd792: sin_q = 15'd30723;
++      10'd793: sin_q = 15'd30740;
++      10'd794: sin_q = 15'd30757;
++      10'd795: sin_q = 15'd30775;
++      10'd796: sin_q = 15'd30792;
++      10'd797: sin_q = 15'd30809;
++      10'd798: sin_q = 15'd30826;
++      10'd799: sin_q = 15'd30843;
++      10'd800: sin_q = 15'd30860;
++      10'd801: sin_q = 15'd30877;
++      10'd802: sin_q = 15'd30894;
++      10'd803: sin_q = 15'd30910;
++      10'd804: sin_q = 15'd30927;
++      10'd805: sin_q = 15'd30944;
++      10'd806: sin_q = 15'd30960;
++      10'd807: sin_q = 15'd30977;
++      10'd808: sin_q = 15'd30993;
++      10'd809: sin_q = 15'd31009;
++      10'd810: sin_q = 15'd31025;
++      10'd811: sin_q = 15'd31041;
++      10'd812: sin_q = 15'd31058;
++      10'd813: sin_q = 15'd31074;
++      10'd814: sin_q = 15'd31089;
++      10'd815: sin_q = 15'd31105;
++      10'd816: sin_q = 15'd31121;
++      10'd817: sin_q = 15'd31137;
++      10'd818: sin_q = 15'd31152;
++      10'd819: sin_q = 15'd31168;
++      10'd820: sin_q = 15'd31183;
++      10'd821: sin_q = 15'd31199;
++      10'd822: sin_q = 15'd31214;
++      10'd823: sin_q = 15'd31229;
++      10'd824: sin_q = 15'd31245;
++      10'd825: sin_q = 15'd31260;
++      10'd826: sin_q = 15'd31275;
++      10'd827: sin_q = 15'd31290;
++      10'd828: sin_q = 15'd31305;
++      10'd829: sin_q = 15'd31319;
++      10'd830: sin_q = 15'd31334;
++      10'd831: sin_q = 15'd31349;
++      10'd832: sin_q = 15'd31363;
++      10'd833: sin_q = 15'd31378;
++      10'd834: sin_q = 15'd31392;
++      10'd835: sin_q = 15'd31407;
++      10'd836: sin_q = 15'd31421;
++      10'd837: sin_q = 15'd31435;
++      10'd838: sin_q = 15'd31449;
++      10'd839: sin_q = 15'd31463;
++      10'd840: sin_q = 15'd31477;
++      10'd841: sin_q = 15'd31491;
++      10'd842: sin_q = 15'd31505;
++      10'd843: sin_q = 15'd31519;
++      10'd844: sin_q = 15'd31533;
++      10'd845: sin_q = 15'd31546;
++      10'd846: sin_q = 15'd31560;
++      10'd847: sin_q = 15'd31573;
++      10'd848: sin_q = 15'd31587;
++      10'd849: sin_q = 15'd31600;
++      10'd850: sin_q = 15'd31613;
++      10'd851: sin_q = 15'd31627;
++      10'd852: sin_q = 15'd31640;
++      10'd853: sin_q = 15'd31653;
++      10'd854: sin_q = 15'd31666;
++      10'd855: sin_q = 15'd31679;
++      10'd856: sin_q = 15'd31691;
++      10'd857: sin_q = 15'd31704;
++      10'd858: sin_q = 15'd31717;
++      10'd859: sin_q = 15'd31729;
++      10'd860: sin_q = 15'd31742;
++      10'd861: sin_q = 15'd31754;
++      10'd862: sin_q = 15'd31767;
++      10'd863: sin_q = 15'd31779;
++      10'd864: sin_q = 15'd31791;
++      10'd865: sin_q = 15'd31803;
++      10'd866: sin_q = 15'd31815;
++      10'd867: sin_q = 15'd31827;
++      10'd868: sin_q = 15'd31839;
++      10'd869: sin_q = 15'd31851;
++      10'd870: sin_q = 15'd31863;
++      10'd871: sin_q = 15'd31875;
++      10'd872: sin_q = 15'd31886;
++      10'd873: sin_q = 15'd31898;
++      10'd874: sin_q = 15'd31909;
++      10'd875: sin_q = 15'd31921;
++      10'd876: sin_q = 15'd31932;
++      10'd877: sin_q = 15'd31943;
++      10'd878: sin_q = 15'd31954;
++      10'd879: sin_q = 15'd31965;
++      10'd880: sin_q = 15'd31976;
++      10'd881: sin_q = 15'd31987;
++      10'd882: sin_q = 15'd31998;
++      10'd883: sin_q = 15'd32009;
++      10'd884: sin_q = 15'd32020;
++      10'd885: sin_q = 15'd32030;
++      10'd886: sin_q = 15'd32041;
++      10'd887: sin_q = 15'd32051;
++      10'd888: sin_q = 15'd32062;
++      10'd889: sin_q = 15'd32072;
++      10'd890: sin_q = 15'd32082;
++      10'd891: sin_q = 15'd32092;
++      10'd892: sin_q = 15'd32103;
++      10'd893: sin_q = 15'd32113;
++      10'd894: sin_q = 15'd32123;
++      10'd895: sin_q = 15'd32132;
++      10'd896: sin_q = 15'd32142;
++      10'd897: sin_q = 15'd32152;
++      10'd898: sin_q = 15'd32162;
++      10'd899: sin_q = 15'd32171;
++      10'd900: sin_q = 15'd32181;
++      10'd901: sin_q = 15'd32190;
++      10'd902: sin_q = 15'd32200;
++      10'd903: sin_q = 15'd32209;
++      10'd904: sin_q = 15'd32218;
++      10'd905: sin_q = 15'd32227;
++      10'd906: sin_q = 15'd32236;
++      10'd907: sin_q = 15'd32245;
++      10'd908: sin_q = 15'd32254;
++      10'd909: sin_q = 15'd32263;
++      10'd910: sin_q = 15'd32272;
++      10'd911: sin_q = 15'd32280;
++      10'd912: sin_q = 15'd32289;
++      10'd913: sin_q = 15'd32297;
++      10'd914: sin_q = 15'd32306;
++      10'd915: sin_q = 15'd32314;
++      10'd916: sin_q = 15'd32322;
++      10'd917: sin_q = 15'd32331;
++      10'd918: sin_q = 15'd32339;
++      10'd919: sin_q = 15'd32347;
++      10'd920: sin_q = 15'd32355;
++      10'd921: sin_q = 15'd32363;
++      10'd922: sin_q = 15'd32371;
++      10'd923: sin_q = 15'd32378;
++      10'd924: sin_q = 15'd32386;
++      10'd925: sin_q = 15'd32394;
++      10'd926: sin_q = 15'd32401;
++      10'd927: sin_q = 15'd32409;
++      10'd928: sin_q = 15'd32416;
++      10'd929: sin_q = 15'd32423;
++      10'd930: sin_q = 15'd32431;
++      10'd931: sin_q = 15'd32438;
++      10'd932: sin_q = 15'd32445;
++      10'd933: sin_q = 15'd32452;
++      10'd934: sin_q = 15'd32459;
++      10'd935: sin_q = 15'd32466;
++      10'd936: sin_q = 15'd32472;
++      10'd937: sin_q = 15'd32479;
++      10'd938: sin_q = 15'd32486;
++      10'd939: sin_q = 15'd32492;
++      10'd940: sin_q = 15'd32499;
++      10'd941: sin_q = 15'd32505;
++      10'd942: sin_q = 15'd32511;
++      10'd943: sin_q = 15'd32517;
++      10'd944: sin_q = 15'd32524;
++      10'd945: sin_q = 15'd32530;
++      10'd946: sin_q = 15'd32536;
++      10'd947: sin_q = 15'd32542;
++      10'd948: sin_q = 15'd32547;
++      10'd949: sin_q = 15'd32553;
++      10'd950: sin_q = 15'd32559;
++      10'd951: sin_q = 15'd32565;
++      10'd952: sin_q = 15'd32570;
++      10'd953: sin_q = 15'd32576;
++      10'd954: sin_q = 15'd32581;
++      10'd955: sin_q = 15'd32586;
++      10'd956: sin_q = 15'd32592;
++      10'd957: sin_q = 15'd32597;
++      10'd958: sin_q = 15'd32602;
++      10'd959: sin_q = 15'd32607;
++      10'd960: sin_q = 15'd32612;
++      10'd961: sin_q = 15'd32617;
++      10'd962: sin_q = 15'd32621;
++      10'd963: sin_q = 15'd32626;
++      10'd964: sin_q = 15'd32631;
++      10'd965: sin_q = 15'd32635;
++      10'd966: sin_q = 15'd32640;
++      10'd967: sin_q = 15'd32644;
++      10'd968: sin_q = 15'd32648;
++      10'd969: sin_q = 15'd32653;
++      10'd970: sin_q = 15'd32657;
++      10'd971: sin_q = 15'd32661;
++      10'd972: sin_q = 15'd32665;
++      10'd973: sin_q = 15'd32669;
++      10'd974: sin_q = 15'd32673;
++      10'd975: sin_q = 15'd32676;
++      10'd976: sin_q = 15'd32680;
++      10'd977: sin_q = 15'd32684;
++      10'd978: sin_q = 15'd32687;
++      10'd979: sin_q = 15'd32691;
++      10'd980: sin_q = 15'd32694;
++      10'd981: sin_q = 15'd32697;
++      10'd982: sin_q = 15'd32701;
++      10'd983: sin_q = 15'd32704;
++      10'd984: sin_q = 15'd32707;
++      10'd985: sin_q = 15'd32710;
++      10'd986: sin_q = 15'd32713;
++      10'd987: sin_q = 15'd32716;
++      10'd988: sin_q = 15'd32718;
++      10'd989: sin_q = 15'd32721;
++      10'd990: sin_q = 15'd32724;
++      10'd991: sin_q = 15'd32726;
++      10'd992: sin_q = 15'd32729;
++      10'd993: sin_q = 15'd32731;
++      10'd994: sin_q = 15'd32733;
++      10'd995: sin_q = 15'd32736;
++      10'd996: sin_q = 15'd32738;
++      10'd997: sin_q = 15'd32740;
++      10'd998: sin_q = 15'd32742;
++      10'd999: sin_q = 15'd32744;
++      10'd1000: sin_q = 15'd32746;
++      10'd1001: sin_q = 15'd32747;
++      10'd1002: sin_q = 15'd32749;
++      10'd1003: sin_q = 15'd32751;
++      10'd1004: sin_q = 15'd32752;
++      10'd1005: sin_q = 15'd32754;
++      10'd1006: sin_q = 15'd32755;
++      10'd1007: sin_q = 15'd32757;
++      10'd1008: sin_q = 15'd32758;
++      10'd1009: sin_q = 15'd32759;
++      10'd1010: sin_q = 15'd32760;
++      10'd1011: sin_q = 15'd32761;
++      10'd1012: sin_q = 15'd32762;
++      10'd1013: sin_q = 15'd32763;
++      10'd1014: sin_q = 15'd32764;
++      10'd1015: sin_q = 15'd32764;
++      10'd1016: sin_q = 15'd32765;
++      10'd1017: sin_q = 15'd32765;
++      10'd1018: sin_q = 15'd32766;
++      10'd1019: sin_q = 15'd32766;
++      10'd1020: sin_q = 15'd32767;
++      10'd1021: sin_q = 15'd32767;
++      10'd1022: sin_q = 15'd32767;
++      10'd1023: sin_q = 15'd32767;
++      endcase
++    end
++  endfunction
++
++  integer             n;
++
++  reg     [31:0]      phase = 'd0;
++
++  // stage 1: table addresses
++  reg                 s1_valid = 'd0;
++  reg     [ 9:0]      s1_addr_s = 'd0;
++  reg     [ 9:0]      s1_addr_c = 'd0;
++  reg                 s1_neg_s = 'd0;
++  reg                 s1_neg_c = 'd0;
++  reg     [15:0]      s1_i = 'd0;
++  reg     [15:0]      s1_q = 'd0;
++
++  // stage 2: table read
++  (* rom_style = "block" *)
++  reg     [14:0]      rom [0:1023];
++  reg     [14:0]      s2_sin = 'd0;
++  reg     [14:0]      s2_cos = 'd0;
++  reg                 s2_valid = 'd0;
++  reg                 s2_neg_s = 'd0;
++  reg                 s2_neg_c = 'd0;
++  reg     [15:0]      s2_i = 'd0;
++  reg     [15:0]      s2_q = 'd0;
++
++  // stage 3: signed sine/cosine
++  reg                 s3_valid = 'd0;
++  reg signed [15:0]   s3_sin = 'd0;
++  reg signed [15:0]   s3_cos = 'd0;
++  reg signed [15:0]   s3_i = 'd0;
++  reg signed [15:0]   s3_q = 'd0;
++
++  // stage 4: products
++  reg                 s4_valid = 'd0;
++  reg signed [31:0]   s4_ic = 'd0;
++  reg signed [31:0]   s4_qs = 'd0;
++  reg signed [31:0]   s4_is = 'd0;
++  reg signed [31:0]   s4_qc = 'd0;
++
++  // stage 5: sums
++  reg                 s5_valid = 'd0;
++  reg signed [32:0]   s5_re = 'd0;
++  reg signed [32:0]   s5_im = 'd0;
++
++  wire    [11:0]      phase_s;
++  wire    [11:0]      phase_c;
++  wire    [17:0]      out_re_s;
++  wire    [17:0]      out_im_s;
++  wire                out_sat_re_s;
++  wire                out_sat_im_s;
++
++  initial begin
++    for (n = 0; n < 1024; n = n + 1) begin
++      rom[n] = sin_q(n);
++    end
++  end
++
++  // phase accumulator, advanced per input sample
++
++  always @(posedge clk) begin
++    if ((rst == 1'b1) || (enable == 1'b0)) begin
++      phase <= 'd0;
++    end else if (in_valid == 1'b1) begin
++      phase <= phase + phase_inc;
++    end
++  end
++
++  // quadrant mapping: q0 T[k], q1 T[1023-k], q2 -T[k], q3 -T[1023-k]
++  // cos(x) = sin(x + pi/2)
++
++  assign phase_s = phase[31:20];
++  assign phase_c = phase[31:20] + 12'd1024;
++
++  always @(posedge clk) begin
++    s1_valid <= in_valid;
++    s1_addr_s <= (phase_s[10] == 1'b1) ? ~phase_s[9:0] : phase_s[9:0];
++    s1_addr_c <= (phase_c[10] == 1'b1) ? ~phase_c[9:0] : phase_c[9:0];
++    s1_neg_s <= phase_s[11];
++    s1_neg_c <= phase_c[11];
++    s1_i <= in_i;
++    s1_q <= in_q;
++  end
++
++  always @(posedge clk) begin
++    s2_valid <= s1_valid;
++    s2_sin <= rom[s1_addr_s];
++    s2_cos <= rom[s1_addr_c];
++    s2_neg_s <= s1_neg_s;
++    s2_neg_c <= s1_neg_c;
++    s2_i <= s1_i;
++    s2_q <= s1_q;
++  end
++
++  always @(posedge clk) begin
++    s3_valid <= s2_valid;
++    s3_sin <= (s2_neg_s == 1'b1) ? -{1'b0, s2_sin} : {1'b0, s2_sin};
++    s3_cos <= (s2_neg_c == 1'b1) ? -{1'b0, s2_cos} : {1'b0, s2_cos};
++    s3_i <= s2_i;
++    s3_q <= s2_q;
++  end
++
++  // (i + jq) * (cos + jsin)
++
++  always @(posedge clk) begin
++    s4_valid <= s3_valid;
++    s4_ic <= s3_i * s3_cos;
++    s4_qs <= s3_q * s3_sin;
++    s4_is <= s3_i * s3_sin;
++    s4_qc <= s3_q * s3_cos;
++  end
++
++  always @(posedge clk) begin
++    s5_valid <= s4_valid;
++    s5_re <= s4_ic - s4_qs;
++    s5_im <= s4_is + s4_qc;
++  end
++
++  // scale by 2^-15 (round half up) and saturate to 16 bits
++
++  assign out_re_s = s5_re[32:15] + s5_re[14];
++  assign out_im_s = s5_im[32:15] + s5_im[14];
++  assign out_sat_re_s = (out_re_s[17:15] != {3{out_re_s[17]}});
++  assign out_sat_im_s = (out_im_s[17:15] != {3{out_im_s[17]}});
++
++  always @(posedge clk) begin
++    out_valid <= s5_valid;
++    out_sat <= s5_valid & (out_sat_re_s | out_sat_im_s);
++    if (s5_valid == 1'b1) begin
++      out_i <= (out_sat_re_s == 1'b1) ? {out_re_s[17], {15{~out_re_s[17]}}} : out_re_s[15:0];
++      out_q <= (out_sat_im_s == 1'b1) ? {out_im_s[17], {15{~out_im_s[17]}}} : out_im_s[15:0];
++    end
++  end
++
++endmodule
++
++// table generator (python):
++//   for k in range(1024):
++//     print("10'd%d: sin_q = 15'd%d;" % (k, round(32767 * sin(pi / 2 * (k + 0.5) / 1024))))
+-- 
+2.43.0
+
