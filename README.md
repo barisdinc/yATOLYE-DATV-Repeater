@@ -16,7 +16,7 @@ the patches.
 
 ## yDATV-Repeater in action
 
-[![yDATV-Repeater in action](https://img.youtube.com/vi/p3D83u95pEU/hqdefault.jpg)](https://youtu.be/p3D83u95pEU)
+▶️ **[Watch on YouTube: AdalmPluto yATOLYE DATV Repeater Project](https://youtu.be/p3D83u95pEU)**
 
 > **Note:** Transmitting at 5.65–5.85 GHz requires an amateur radio licence
 > and is subject to your national band plan. The AD9363 on the Pluto is only
