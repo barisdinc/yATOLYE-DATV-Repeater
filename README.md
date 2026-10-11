@@ -14,6 +14,10 @@ the official [Analog Devices PlutoSDR firmware](https://github.com/analogdevices
 (release `v0.38`), plus a script that downloads that firmware and applies
 the patches.
 
+## yDATV-Repeater in action
+
+[![yDATV-Repeater in action](https://img.youtube.com/vi/p3D83u95pEU/hqdefault.jpg)](https://youtu.be/p3D83u95pEU)
+
 > **Note:** Transmitting at 5.65–5.85 GHz requires an amateur radio licence
 > and is subject to your national band plan. The AD9363 on the Pluto is only
 > specified up to 3.8 GHz. At 5.8 GHz it works in AD9364 mode, but the output
