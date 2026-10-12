@@ -131,9 +131,10 @@ transmitter without resampling or clock domain crossing.
   └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-When the repeater and the beacon are both **disabled**, the TX path gets the
-normal DMA/interpolator data, so the Pluto behaves like a stock unit. When
-the **repeater** is enabled, the TX gets the processed RX samples. When the
+$\color{green}\textbf{When the repeater and the beacon are both disabled, the TX path gets the}$
+$\color{green}\textbf{normal DMA/interpolator data, so the Pluto behaves like a stock unit.}$
+
+When the **repeater** is enabled, the TX gets the processed RX samples. When the
 **beacon** is enabled, the DMA/interpolator data is multiplied by
 e^(j·2π·f·n/fs) (frequency shift by `BEACON_FREQ`) and added to the repeater
 output with saturation. The squelch and the force mute act on the repeater
