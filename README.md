@@ -409,6 +409,20 @@ fw_setenv attr_val ad9364
 reboot
 ```
 
+### Simulation
+
+`sim/tb_axi_datv_xpdr.v` tests the FPGA core in the Vivado simulator: register
+access, bypass, gain, saturation, power detector, squelch, force mute, the
+beacon NCO / mixer and the sum of the repeater and beacon paths. Run it
+against the patched hdl tree created by `setup.sh`:
+
+```sh
+sim/run.sh                       # uses ./plutosdr-fw/hdl
+sim/run.sh /path/to/plutosdr-fw/hdl
+```
+
+It prints one line per check and ends with `ALL TESTS PASSED` (exit code 0).
+
 ---
 
 ## Repository layout
@@ -417,6 +431,9 @@ reboot
 .
 ├── README.md
 ├── setup.sh                     # clone plutosdr-fw v0.38 and apply the patches
+├── sim
+│   ├── run.sh                   # run the testbench with Vivado xsim
+│   └── tb_axi_datv_xpdr.v       # axi_datv_xpdr testbench
 └── patches
     ├── hdl
     │   ├── 0001-library-Add-axi_datv_xpdr-DATV-transponder-core.patch
